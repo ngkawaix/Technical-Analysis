@@ -4,9 +4,10 @@
 # Target platform : Streamlit Community Cloud (any Python 3.9–3.14)
 # Last validated  : June 2026
 #
-# TensorFlow has been removed entirely. The LSTM is now implemented in
-# pure numpy (BPTT + Adam from scratch). Identical mathematical behaviour,
-# zero framework dependency, works on any Python version Streamlit Cloud uses.
+# TensorFlow and hmmlearn removed — both had broken C extensions on Python 3.14.
+# LSTM implemented in
+# pure numpy (BPTT + Adam). HMM uses Baum-Welch via scipy only. Identical
+# mathematical behaviour, works on any Python version Streamlit Cloud uses.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Core web framework ────────────────────────────────────────────────────────
@@ -27,4 +28,3 @@ plotly>=5.20.0
 # ── Machine learning ──────────────────────────────────────────────────────────
 scikit-learn>=1.4.0
 xgboost>=2.0.0
-hmmlearn>=0.3.0
