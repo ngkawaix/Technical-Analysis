@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .gitignore  —  Technical Analysis (ML) App
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE config
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Streamlit local cache (not needed in repo — Streamlit Cloud has its own cache)
+.streamlit/secrets.toml     # NEVER commit secrets — use Streamlit Cloud secrets manager
+
+# Model artefacts — if you ever cache trained models to disk
+*.h5
+*.pkl
+*.joblib
+saved_models/
+
+# Data files — prices are fetched live from Yahoo Finance
+*.csv
+*.parquet
+*.feather
+
+# Log files
+*.log

@@ -1,0 +1,1810 @@
+import warnings
+warnings.filterwarnings("ignore")
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import date, datetime, timedelta
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Technical Analysis (ML)",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+TICKERS = sorted([
+    "AAPL", "ADBE", "AMAT", "AMZN", "ASML", "SPGI",
+    "FICO", "GOOGL", "LRCX", "MA",   "META", "MSCI",
+    "MSFT", "NFLX", "NVDA", "TSM",  "V",
+])
+
+REGIME_COLORS = {
+    0: "#1D9E75",   # Bull / Low Vol  — teal
+    1: "#F5A623",   # Transition       — amber
+    2: "#D85A30",   # Bear / High Vol  — coral
+}
+REGIME_LABELS = {0: "Bull / Low-Vol", 1: "Transitional", 2: "Bear / High-Vol"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CSS  — dark-panel trading dashboard aesthetic
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* --- typography & base --- */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+/* Sidebar */
+[data-testid="stSidebar"] { background: #0d1117; }
+[data-testid="stSidebar"] * { color: #c9d1d9 !important; }
+
+/* Metric cards */
+[data-testid="stMetric"] {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px 16px;
+}
+[data-testid="stMetricLabel"] { font-size: 0.72rem; color: #8b949e !important; text-transform: uppercase; letter-spacing: 0.05em; }
+[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; font-size: 1.35rem; color: #e6edf3 !important; }
+
+/* Signal badge helper classes (applied via HTML) */
+.bull  { color: #1D9E75; font-weight: 600; }
+.bear  { color: #D85A30; font-weight: 600; }
+.neut  { color: #8b949e; font-weight: 500; }
+
+/* Tab strip */
+[data-baseweb="tab-list"] { border-bottom: 1px solid #30363d; gap: 4px; }
+[data-baseweb="tab"] { font-size: 0.83rem; padding: 6px 14px; border-radius: 6px 6px 0 0; }
+
+/* Expander */
+details > summary { font-size: 0.85rem; color: #8b949e; }
+
+/* Mono code inline */
+code { background: #161b22; border: 1px solid #30363d; border-radius: 4px;
+       padding: 1px 5px; font-family: 'IBM Plex Mono', monospace; font-size: 0.82em; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LOADING
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Fetching daily price data…", ttl=3600)
+def load_prices(tickers, start="2018-01-01"):
+    raw = yf.download(tickers, start=start, interval="1d", auto_adjust=True, progress=False)
+    closes = raw["Close"]
+    closes.index = pd.to_datetime(closes.index).tz_localize(None)
+    closes = closes.ffill().dropna(how="all")
+    return closes, raw["Volume"].ffill().dropna(how="all")
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_spy(start="2018-01-01"):
+    raw = yf.download("SPY", start=start, auto_adjust=True, progress=False)
+    s = raw["Close"].squeeze()
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    return s
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE ENGINEERING  (all features explained term-by-term in the UI)
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_features(prices: pd.Series, volumes: pd.Series) -> pd.DataFrame:
+    """
+    Compute a rich feature set for one stock.
+
+    Feature glossary (mirrors the UI explainers):
+    ─ ret_1d/5d/21d : log return over 1 / 5 / 21 days
+    ─ rsi_14        : Relative Strength Index, 14-day window
+    ─ macd_line     : MACD line = EMA(12) − EMA(26)
+    ─ macd_signal   : 9-day EMA of the MACD line
+    ─ macd_hist     : histogram = macd_line − macd_signal
+    ─ bb_pct        : price position inside Bollinger Bands (0=lower, 1=upper)
+    ─ bb_width      : band width normalised by mid-band (proxy for vol regime)
+    ─ atr_14        : Average True Range over 14 days (absolute volatility)
+    ─ vol_21        : 21-day realised volatility (annualised)
+    ─ vol_ratio     : vol_5d / vol_63d  — short vs long vol regime
+    ─ obv_norm      : On-Balance Volume normalised by 21-day mean
+    ─ price_vs_sma20: (price / SMA20) − 1
+    ─ price_vs_sma50: (price / SMA50) − 1
+    ─ price_vs_sma200:(price / SMA200)− 1
+    ─ high_52w_pct  : distance from 52-week high
+    ─ low_52w_pct   : distance from 52-week low
+    """
+    df = pd.DataFrame({"close": prices, "volume": volumes})
+    df["ret_1d"]  = np.log(df["close"] / df["close"].shift(1))
+    df["ret_5d"]  = np.log(df["close"] / df["close"].shift(5))
+    df["ret_21d"] = np.log(df["close"] / df["close"].shift(21))
+
+    # RSI
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    df["rsi_14"] = 100 - 100 / (1 + rs)
+
+    # MACD
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd_line"]   = ema12 - ema26
+    df["macd_signal"] = df["macd_line"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"]   = df["macd_line"] - df["macd_signal"]
+
+    # Bollinger Bands (20-day)
+    sma20    = df["close"].rolling(20).mean()
+    std20    = df["close"].rolling(20).std()
+    upper_bb = sma20 + 2 * std20
+    lower_bb = sma20 - 2 * std20
+    df["bb_pct"]   = (df["close"] - lower_bb) / (upper_bb - lower_bb + 1e-9)
+    df["bb_width"] = (upper_bb - lower_bb) / (sma20 + 1e-9)
+
+    # ATR
+    prev_close = df["close"].shift(1)
+    df["atr_14"] = pd.concat([
+        (df["close"] - df["close"]).abs(),   # placeholder for high-low (using close diff)
+        (df["close"] - prev_close).abs(),
+    ], axis=1).max(axis=1).rolling(14).mean()
+
+    # Volatility
+    df["vol_21"]   = df["ret_1d"].rolling(21).std() * np.sqrt(252)
+    df["vol_ratio"] = df["ret_1d"].rolling(5).std() / (df["ret_1d"].rolling(63).std() + 1e-9)
+
+    # OBV
+    obv = (np.sign(df["ret_1d"]) * df["volume"]).cumsum()
+    df["obv_norm"] = obv / (obv.rolling(21).mean() + 1e-9)
+
+    # SMA distances
+    df["price_vs_sma20"]  = df["close"] / sma20 - 1
+    df["price_vs_sma50"]  = df["close"] / df["close"].rolling(50).mean() - 1
+    df["price_vs_sma200"] = df["close"] / df["close"].rolling(200).mean() - 1
+
+    # 52-week extremes
+    df["high_52w_pct"] = df["close"] / df["close"].rolling(252).max() - 1
+    df["low_52w_pct"]  = df["close"] / df["close"].rolling(252).min() - 1
+
+    return df.dropna()
+
+FEATURE_COLS = [
+    "ret_1d","ret_5d","ret_21d",
+    "rsi_14",
+    "macd_line","macd_signal","macd_hist",
+    "bb_pct","bb_width",
+    "atr_14","vol_21","vol_ratio",
+    "obv_norm",
+    "price_vs_sma20","price_vs_sma50","price_vs_sma200",
+    "high_52w_pct","low_52w_pct",
+]
+
+FEATURE_GLOSSARY = {
+    "ret_1d":          ("1-Day Log Return",      "log(P_t / P_{t-1})",       "Captures the most recent daily price momentum."),
+    "ret_5d":          ("5-Day Log Return",       "log(P_t / P_{t-5})",       "Weekly momentum; smooths out single-day noise."),
+    "ret_21d":         ("21-Day Log Return",      "log(P_t / P_{t-21})",      "Monthly momentum, the primary ML input for trend direction."),
+    "rsi_14":          ("RSI (14)",               "100 - 100/(1+RS)",         "RS = avg(14d gains)/avg(14d losses). >70 = overbought; <30 = oversold."),
+    "macd_line":       ("MACD Line",              "EMA(12) − EMA(26)",        "Fast minus slow exponential moving average. Cross above zero = bullish."),
+    "macd_signal":     ("MACD Signal",            "EMA(9) of MACD line",      "Trigger line. When MACD line crosses above signal, that's a buy signal."),
+    "macd_hist":       ("MACD Histogram",         "MACD line − Signal",       "Speed of the MACD divergence. Positive and rising = accelerating bull momentum."),
+    "bb_pct":          ("Bollinger %B",           "(P − Lower) / (Upper − Lower)", "0 = at lower band (oversold), 1 = at upper band (overbought)."),
+    "bb_width":        ("Bollinger Band Width",   "(Upper − Lower) / SMA20",  "Narrow bands → volatility compression (breakout likely). Wide → expansion."),
+    "atr_14":          ("ATR (14)",               "14-day avg of |ΔP|",       "Absolute daily volatility. High ATR = large daily swings, risk is elevated."),
+    "vol_21":          ("21d Realised Vol",       "σ(ret_1d,21) × √252",      "Annualised volatility. The core regime signal: low vol = bull, high vol = bear."),
+    "vol_ratio":       ("Vol Ratio (5d/63d)",     "σ_5d / σ_63d",             ">1 = short-term vol is elevated vs. long-term average. Regime stress indicator."),
+    "obv_norm":        ("OBV (normalised)",       "Σ sign(ret)×Vol / OBV_mean21", "On-Balance Volume. Rising OBV with flat price = accumulation (bullish). OBV normalised by its 21-day mean."),
+    "price_vs_sma20":  ("Price vs SMA20",         "P/SMA20 − 1",              "Short-term trend. >0 = price above 20-day average (momentum supports bulls)."),
+    "price_vs_sma50":  ("Price vs SMA50",         "P/SMA50 − 1",              "Medium-term trend. The '50-day golden cross' signal when SMA50 > SMA200."),
+    "price_vs_sma200": ("Price vs SMA200",        "P/SMA200 − 1",             "Long-term trend health. Being above SMA200 is the primary bull-market condition."),
+    "high_52w_pct":    ("Distance from 52W High", "P/max(P,252) − 1",         "How far from the yearly high. Near 0 = strength. Far below = possible downtrend."),
+    "low_52w_pct":     ("Distance from 52W Low",  "P/min(P,252) − 1",         "How far above the yearly low. Near 0 = price is at yearly support."),
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIME DETECTION  (Hidden Markov Model)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Fitting HMM regime model…", ttl=3600)
+def fit_hmm(returns: pd.Series, n_regimes: int = 3):
+    """
+    Fit a Gaussian Hidden Markov Model to daily log-returns.
+
+    The HMM assumes the market cycles through n_regimes hidden states.
+    At each day, the model uses two observables: return and volatility (|return|).
+    It learns transition probabilities between states and which state best
+    explains the observed return/vol pattern at each point in time.
+
+    Parameters
+    ----------
+    returns   : pd.Series of daily log-returns
+    n_regimes : number of hidden states (default 3: bull / transition / bear)
+
+    Returns
+    -------
+    regimes   : pd.Series of integer state labels, aligned to returns.index
+    model     : fitted GaussianHMM object (for transition matrix inspection)
+    """
+    from hmmlearn.hmm import GaussianHMM
+
+    r = returns.dropna().values
+    X = np.column_stack([r, np.abs(r)])   # (return, |return|) — captures direction + magnitude
+
+    model = GaussianHMM(
+        n_components=n_regimes,
+        covariance_type="full",
+        n_iter=2000,
+        random_state=42,
+    )
+    model.fit(X)
+    hidden_states = model.predict(X)
+
+    # Re-label states so 0 = lowest volatility (bull), n-1 = highest (bear)
+    state_vols = {s: np.abs(r[hidden_states == s]).mean() for s in range(n_regimes)}
+    ordered    = sorted(state_vols, key=state_vols.get)
+    remap      = {old: new for new, old in enumerate(ordered)}
+    relabeled  = np.array([remap[s] for s in hidden_states])
+
+    regimes = pd.Series(relabeled, index=returns.dropna().index, name="regime")
+    return regimes, model, remap
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML SIGNAL MODEL  (Random Forest + XGBoost ensemble)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Training RF + XGBoost signal model…", ttl=3600)
+def train_ml_model(feat_df: pd.DataFrame, lookahead: int = 5):
+    """
+    Train a binary classifier: will the stock be up more than 0% over the next
+    `lookahead` days?
+
+    Methodology
+    -----------
+    1. Target  : y = 1 if forward_ret > 0 else 0
+       (lookahead log-return computed on the *training* set to avoid leakage)
+    2. Walk-forward split: train on first 70%, test on last 30% — never train
+       on data the model would not have seen in real time.
+    3. Ensemble: RandomForest + XGBoost vote equally (soft voting on probabilities).
+    4. Feature importances: averaged across both models.
+
+    Returns
+    -------
+    prob_series   : pd.Series of P(up) for each day in the test window
+    importances   : pd.Series of feature importances
+    train_end_idx : the date where training ended
+    accuracy      : float, out-of-sample accuracy
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import accuracy_score
+    import xgboost as xgb
+
+    df = feat_df[FEATURE_COLS].copy()
+    df["fwd_ret"] = np.log(feat_df["close"].shift(-lookahead) / feat_df["close"])
+    df = df.dropna()
+
+    X = df[FEATURE_COLS].values
+    y = (df["fwd_ret"] > 0).astype(int).values
+    idx = df.index
+
+    split = int(len(X) * 0.70)
+    X_tr, X_te = X[:split], X[split:]
+    y_tr, y_te = y[:split], y[split:]
+    idx_te = idx[split:]
+
+    scaler = StandardScaler()
+    X_tr_s = scaler.fit_transform(X_tr)
+    X_te_s = scaler.transform(X_te)
+
+    rf = RandomForestClassifier(n_estimators=300, max_depth=5, min_samples_leaf=20,
+                                 random_state=42, n_jobs=-1)
+    rf.fit(X_tr_s, y_tr)
+
+    xgb_m = xgb.XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                subsample=0.8, colsample_bytree=0.8,
+                                eval_metric="logloss", random_state=42,
+                                verbosity=0, use_label_encoder=False)
+    xgb_m.fit(X_tr_s, y_tr)
+
+    prob_rf  = rf.predict_proba(X_te_s)[:, 1]
+    prob_xgb = xgb_m.predict_proba(X_te_s)[:, 1]
+    prob_ens = 0.5 * prob_rf + 0.5 * prob_xgb
+
+    preds    = (prob_ens > 0.5).astype(int)
+    accuracy = accuracy_score(y_te, preds)
+
+    # Feature importances — average of both models
+    imp_rf  = rf.feature_importances_
+    imp_xgb = xgb_m.feature_importances_
+    importances = pd.Series(
+        0.5 * imp_rf + 0.5 * imp_xgb,
+        index=FEATURE_COLS,
+    ).sort_values(ascending=False)
+
+    prob_series = pd.Series(prob_ens, index=idx_te, name="prob_up")
+    train_end   = idx[split - 1]
+    return prob_series, importances, train_end, accuracy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LSTM FORECASTING
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner="Training LSTM price forecaster…", ttl=3600)
+def train_lstm(prices: pd.Series, seq_len: int = 30, horizon: int = 5,
+               epochs: int = 25):
+    """
+    Train a simple LSTM to predict the next `horizon`-day cumulative return.
+
+    Architecture
+    ------------
+    Input  : sequence of the last `seq_len` days of normalised features
+             (here: [close, vol_5d, rsi_14] for interpretability)
+    Layers : LSTM(64) → Dropout(0.2) → Dense(32) → Dense(1)
+    Output : predicted log-return for the next `horizon` days
+
+    Walk-forward: train on first 70%, generate predictions for last 30%.
+    Normalisation is done per-window (divide by first value in window)
+    so the model learns *shape* rather than absolute price levels.
+
+    Returns
+    -------
+    preds     : pd.Series of predicted next-horizon log-return
+    actuals   : pd.Series of actual next-horizon log-return
+    train_end : date where training ended
+    """
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
+    tf.get_logger().setLevel("ERROR")
+
+    # Feature matrix: close + 5d vol + RSI
+    close   = prices.values
+    ret_1d  = np.diff(np.log(close), prepend=np.log(close[0]))
+    vol_5d  = pd.Series(ret_1d).rolling(5).std().fillna(method="bfill").values
+    rsi_raw = pd.Series(close)
+    delta   = rsi_raw.diff()
+    gain    = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+    loss    = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+    rsi     = (100 - 100 / (1 + gain / (loss + 1e-9))).fillna(50).values / 100
+
+    feat_arr = np.column_stack([close / close[0], vol_5d * 100, rsi])  # (T, 3)
+    n        = len(feat_arr)
+
+    # Construct sequences
+    X_all, y_all = [], []
+    for i in range(seq_len, n - horizon):
+        window = feat_arr[i - seq_len: i]
+        window = window / (window[0] + 1e-9)          # normalise per window
+        fwd    = np.log(close[i + horizon] / close[i]) # target: log-return
+        X_all.append(window)
+        y_all.append(fwd)
+
+    X_all = np.array(X_all)
+    y_all = np.array(y_all)
+    idx   = prices.index[seq_len: n - horizon]
+
+    split   = int(len(X_all) * 0.70)
+    X_tr, X_te = X_all[:split], X_all[split:]
+    y_tr, y_te = y_all[:split], y_all[split:]
+
+    model = Sequential([
+        LSTM(64, input_shape=(seq_len, 3), return_sequences=False),
+        Dropout(0.2),
+        Dense(32, activation="relu"),
+        Dense(1),
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    es = EarlyStopping(patience=5, restore_best_weights=True, verbose=0)
+    model.fit(X_tr, y_tr, epochs=epochs, batch_size=32,
+              validation_split=0.15, callbacks=[es], verbose=0)
+
+    y_pred = model.predict(X_te, verbose=0).flatten()
+
+    preds    = pd.Series(y_pred, index=idx[split:], name="lstm_pred")
+    actuals  = pd.Series(y_te,   index=idx[split:], name="actual")
+    train_end = idx[split - 1]
+    return preds, actuals, train_end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLASSIC TECHNICALS (baseline, all-in-one)
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_technicals(feat_df: pd.DataFrame) -> dict:
+    last = feat_df.iloc[-1]
+
+    def rsi_signal(rsi):
+        if rsi > 70:   return "Overbought", "bear"
+        if rsi < 30:   return "Oversold",   "bull"
+        return "Neutral", "neut"
+
+    def macd_signal(hist):
+        if hist > 0:  return "Bullish", "bull"
+        if hist < 0:  return "Bearish", "bear"
+        return "Flat", "neut"
+
+    def bb_signal(pct):
+        if pct > 0.95: return "Upper band — overbought", "bear"
+        if pct < 0.05: return "Lower band — oversold",  "bull"
+        return "Mid-range", "neut"
+
+    def sma_signal(vs20, vs200):
+        if vs20 > 0 and vs200 > 0: return "Price above both SMAs — bull trend", "bull"
+        if vs20 < 0 and vs200 < 0: return "Price below both SMAs — bear trend", "bear"
+        return "Mixed signals", "neut"
+
+    rsi_txt, rsi_cls = rsi_signal(last["rsi_14"])
+    macd_txt, macd_cls = macd_signal(last["macd_hist"])
+    bb_txt, bb_cls = bb_signal(last["bb_pct"])
+    sma_txt, sma_cls = sma_signal(last["price_vs_sma20"], last["price_vs_sma200"])
+
+    return {
+        "RSI (14)":        (f"{last['rsi_14']:.1f}  —  {rsi_txt}",  rsi_cls),
+        "MACD Histogram":  (f"{last['macd_hist']:.3f}  —  {macd_txt}", macd_cls),
+        "Bollinger %B":    (f"{last['bb_pct']:.2f}  —  {bb_txt}",   bb_cls),
+        "SMA Trend":       (sma_txt, sma_cls),
+        "Vol (21d ann.)":  (f"{last['vol_21']:.1%}", "neut"),
+        "Vol Regime":      ("Elevated" if last["vol_ratio"] > 1.2 else "Normal",
+                            "bear" if last["vol_ratio"] > 1.2 else "bull"),
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("⚙️  Settings")
+    st.caption("Technical Analysis — ML Edition")
+    st.divider()
+
+    selected_ticker = st.selectbox("Stock", TICKERS, index=TICKERS.index("NVDA"))
+    n_regimes = st.radio("HMM Regime Count", [2, 3], index=1, horizontal=True)
+    lookahead = st.slider("ML signal lookahead (days)", 1, 21, 5, 1,
+                          help="How many days ahead the RF/XGB model targets. "
+                               "5d = one trading week.")
+    lstm_horizon = st.slider("LSTM forecast horizon (days)", 3, 21, 5, 1)
+    st.divider()
+    data_start = st.date_input("Data start", value=date(2018, 1, 1),
+                               min_value=date(2015, 1, 1),
+                               max_value=(datetime.today() - timedelta(days=365*2)).date())
+    st.divider()
+    st.caption("💡 **How the app fits together:**\n\n"
+               "- **Overview**: daily dashboard of all signals in one glance\n"
+               "- **Technicals**: classic indicators explained\n"
+               "- **Regime**: HMM detects market states from hidden volatility patterns\n"
+               "- **ML Signals**: RF+XGBoost predict short-term direction\n"
+               "- **LSTM Forecast**: deep learning on price sequences\n"
+               "- **Universe**: all 17 stocks at once")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA LOAD
+# ─────────────────────────────────────────────────────────────────────────────
+start_str = data_start.strftime("%Y-%m-%d")
+with st.spinner("Loading price & volume data for the full universe…"):
+    closes, volumes = load_prices(TICKERS, start=start_str)
+    spy = load_spy(start=start_str)
+
+# Filter to selected ticker
+price_s  = closes[selected_ticker].dropna()
+volume_s = volumes[selected_ticker].dropna()
+
+with st.spinner("Engineering features…"):
+    feat_df = compute_features(price_s, volume_s)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HEADER
+# ─────────────────────────────────────────────────────────────────────────────
+last_price  = float(price_s.iloc[-1])
+prev_price  = float(price_s.iloc[-2])
+daily_ret   = (last_price / prev_price) - 1
+last_date   = price_s.index[-1].strftime("%d %b %Y")
+
+st.title("🔬 Technical Analysis — ML Edition")
+st.caption(
+    f"Daily analysis as of **{last_date}**  |  "
+    f"Universe: **{len(TICKERS)} stocks**  |  "
+    f"Data from: **{start_str}**  |  "
+    f"Companion to the **Portfolio Optimiser (DCF-BL)** app"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABS
+# ─────────────────────────────────────────────────────────────────────────────
+tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Overview",
+    "📈 Technicals",
+    "🔄 Regime Detection",
+    "🤖 ML Signals",
+    "🧠 LSTM Forecast",
+    "🌐 Universe Scanner",
+    "💼 Rebalancing Planner",
+])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 0 — DAILY OVERVIEW DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+with tab0:
+    st.markdown(f"### {selected_ticker}  —  Daily Signal Dashboard")
+
+    # Key metrics row
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Last Price",  f"${last_price:,.2f}", f"{daily_ret:+.2%}")
+    c2.metric("RSI (14)",    f"{feat_df['rsi_14'].iloc[-1]:.1f}",
+              "Overbought" if feat_df["rsi_14"].iloc[-1] > 70 else
+              ("Oversold" if feat_df["rsi_14"].iloc[-1] < 30 else "Neutral"))
+    c3.metric("MACD Hist",   f"{feat_df['macd_hist'].iloc[-1]:+.3f}",
+              "↑ Bullish" if feat_df["macd_hist"].iloc[-1] > 0 else "↓ Bearish")
+    c4.metric("Vol (21d)",   f"{feat_df['vol_21'].iloc[-1]:.1%}")
+    c5.metric("Bollinger %B",f"{feat_df['bb_pct'].iloc[-1]:.2f}")
+
+    st.divider()
+
+    col_l, col_r = st.columns([3, 2])
+
+    with col_l:
+        st.markdown("#### Price + Bollinger Bands + Volume")
+        lookback_days = 252
+        pdf  = feat_df.tail(lookback_days)
+        sma20 = pdf["close"].rolling(20).mean()
+        std20 = pdf["close"].rolling(20).std()
+        upper = sma20 + 2 * std20
+        lower = sma20 - 2 * std20
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=upper.index, y=upper, line=dict(color="rgba(100,149,237,0.4)", width=1),
+                                  showlegend=False, name="Upper BB"))
+        fig.add_trace(go.Scatter(x=lower.index, y=lower, fill="tonexty",
+                                  fillcolor="rgba(100,149,237,0.07)",
+                                  line=dict(color="rgba(100,149,237,0.4)", width=1),
+                                  name="Bollinger Band"))
+        fig.add_trace(go.Scatter(x=sma20.index, y=sma20, line=dict(color="#F5A623", width=1.2, dash="dash"),
+                                  name="SMA 20"))
+        fig.add_trace(go.Scatter(x=pdf.index, y=pdf["close"],
+                                  line=dict(color="#1D9E75", width=1.8), name="Price"))
+        fig.update_layout(height=320, margin=dict(t=20, b=10),
+                          legend=dict(orientation="h", y=1.05),
+                          plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                          xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#30363d"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_r:
+        st.markdown("#### Classic Signal Summary")
+        technicals = compute_technicals(feat_df)
+        for indicator, (value, cls) in technicals.items():
+            st.markdown(
+                f"<div style='display:flex; justify-content:space-between; padding:6px 0; "
+                f"border-bottom:1px solid #30363d;'>"
+                f"<span style='color:#8b949e; font-size:0.82rem;'>{indicator}</span>"
+                f"<span class='{cls}' style='font-size:0.82rem;'>{value}</span></div>",
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+    st.markdown("#### RSI  ·  MACD  (last 252 trading days)")
+    fig_ind = go.Figure()
+    fig_ind.add_trace(go.Scatter(x=pdf.index, y=pdf["rsi_14"], line=dict(color="#1D9E75", width=1.5),
+                                  name="RSI (14)", yaxis="y"))
+    fig_ind.add_hline(y=70, line_dash="dot", line_color="#D85A30", annotation_text="Overbought 70", yref="y")
+    fig_ind.add_hline(y=30, line_dash="dot", line_color="#1D9E75", annotation_text="Oversold 30",   yref="y")
+    fig_ind.add_trace(go.Bar(x=pdf.index, y=pdf["macd_hist"],
+                              marker_color=np.where(pdf["macd_hist"] >= 0, "#1D9E75", "#D85A30"),
+                              name="MACD Hist", yaxis="y2", opacity=0.75))
+    fig_ind.update_layout(
+        height=250, margin=dict(t=20, b=10),
+        yaxis=dict(title="RSI", range=[0, 100], gridcolor="#30363d"),
+        yaxis2=dict(title="MACD Hist", overlaying="y", side="right", gridcolor="#30363d"),
+        legend=dict(orientation="h", y=1.1),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_ind, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — CLASSIC TECHNICALS (deep explainers)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    st.markdown("#### Technical Indicators — Every Term Explained")
+    st.markdown(
+        "This tab treats classic technical indicators as the **baseline** for the ML models. "
+        "The ML models later learn which of these signals — and in which combinations — are "
+        "actually predictive on this specific stock. Think of this tab as building intuition "
+        "before the machine gets involved."
+    )
+    st.divider()
+
+    # Feature glossary table
+    with st.expander("📖 Feature Glossary — all 18 model inputs defined", expanded=False):
+        rows = []
+        for col, (name, formula, meaning) in FEATURE_GLOSSARY.items():
+            rows.append({"Feature": col, "Name": name, "Formula": formula, "What it tells you": meaning})
+        st.dataframe(pd.DataFrame(rows).set_index("Feature"), use_container_width=True,
+                     column_config={
+                         "Formula": st.column_config.TextColumn("Formula (LaTeX-free)", width="medium"),
+                         "What it tells you": st.column_config.TextColumn("What it tells you", width="large"),
+                     })
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("##### RSI (14)  — Relative Strength Index")
+        st.markdown("""
+**The why:** RSI measures *how fast* a stock has moved, not just by how much.
+A stock that rose sharply in the last 14 days is likely to mean-revert — RSI flags this.
+
+**Every term:**
+- `Gain_avg` = 14-day exponential moving average of *positive* daily changes
+- `Loss_avg` = 14-day EMA of *negative* daily changes (absolute value)
+- `RS` = Gain_avg / Loss_avg  —  ratio of up-momentum to down-momentum
+- `RSI = 100 − 100 / (1 + RS)` — normalised to 0–100
+  - RSI > 70 → the stock has gained unusually fast → **overbought** (potential short-term reversal)
+  - RSI < 30 → the stock has fallen unusually fast → **oversold** (potential bounce)
+  - 30–70 → neutral territory
+        """)
+        lookback = feat_df.tail(252)
+        fig_rsi = go.Figure()
+        fig_rsi.add_trace(go.Scatter(x=lookback.index, y=lookback["rsi_14"],
+                                      line=dict(color="#1D9E75", width=1.5), name="RSI"))
+        fig_rsi.add_hline(y=70, line_dash="dot", line_color="#D85A30", annotation_text="Overbought")
+        fig_rsi.add_hline(y=30, line_dash="dot", line_color="#1D9E75", annotation_text="Oversold")
+        fig_rsi.add_hline(y=50, line_dash="dash", line_color="#8b949e", opacity=0.4)
+        fig_rsi.update_layout(height=200, margin=dict(t=10, b=10),
+                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                               yaxis=dict(range=[0, 100], gridcolor="#30363d"), showlegend=False)
+        st.plotly_chart(fig_rsi, use_container_width=True)
+
+    with col_b:
+        st.markdown("##### MACD — Moving Average Convergence/Divergence")
+        st.markdown("""
+**The why:** MACD detects changes in *trend momentum* by comparing two exponential
+moving averages of different speeds.
+
+**Every term:**
+- `EMA(12)` = 12-day Exponential Moving Average — short-term trend tracker
+- `EMA(26)` = 26-day EMA — long-term trend tracker
+- `MACD Line = EMA(12) − EMA(26)` — positive = short-term faster than long-term → bullish
+- `Signal Line = EMA(9) of MACD Line` — smoothed trigger; a crossover above = buy signal
+- `Histogram = MACD Line − Signal` — *speed of divergence*; rising bars = accelerating
+  momentum, even before the zero-cross
+
+Traders watch the **zero-line cross** (MACD goes positive) and the **signal-line cross**
+(MACD crosses above its signal) as entry signals.
+        """)
+        fig_macd = go.Figure()
+        fig_macd.add_trace(go.Scatter(x=lookback.index, y=lookback["macd_line"],
+                                       line=dict(color="#1D9E75", width=1.5), name="MACD Line"))
+        fig_macd.add_trace(go.Scatter(x=lookback.index, y=lookback["macd_signal"],
+                                       line=dict(color="#F5A623", width=1.2, dash="dash"), name="Signal"))
+        fig_macd.add_trace(go.Bar(x=lookback.index, y=lookback["macd_hist"],
+                                   marker_color=np.where(lookback["macd_hist"] >= 0, "#1D9E75", "#D85A30"),
+                                   name="Histogram", opacity=0.7))
+        fig_macd.add_hline(y=0, line_color="#8b949e", line_width=0.8)
+        fig_macd.update_layout(height=200, margin=dict(t=10, b=10),
+                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                                yaxis=dict(gridcolor="#30363d"),
+                                legend=dict(orientation="h", y=1.15, font_size=10))
+        st.plotly_chart(fig_macd, use_container_width=True)
+
+    st.divider()
+    col_c, col_d = st.columns(2)
+
+    with col_c:
+        st.markdown("##### Bollinger Bands")
+        st.markdown("""
+**The why:** Bollinger Bands define a *dynamic price envelope* based on recent volatility.
+When the bands narrow, a breakout is likely. When price touches a band, mean-reversion may follow.
+
+**Every term:**
+- `SMA20` = 20-day Simple Moving Average — the mid-band / baseline
+- `σ` (sigma) = standard deviation of closing prices over 20 days — measures recent volatility
+- `Upper Band = SMA20 + 2σ` — price this far above average is statistically unusual
+- `Lower Band = SMA20 − 2σ` — price this far below average is statistically unusual
+- `%B = (Price − Lower) / (Upper − Lower)` — normalised position: 0 = lower, 1 = upper
+- `Band Width = (Upper − Lower) / SMA20` — wider = more volatile; narrow = compression before move
+        """)
+        sma20_full = feat_df["close"].rolling(20).mean()
+        std20_full = feat_df["close"].rolling(20).std()
+        upper_f    = (sma20_full + 2 * std20_full).tail(252)
+        lower_f    = (sma20_full - 2 * std20_full).tail(252)
+        sma20_f    = sma20_full.tail(252)
+        close_f    = feat_df["close"].tail(252)
+
+        fig_bb = go.Figure()
+        fig_bb.add_trace(go.Scatter(x=upper_f.index, y=upper_f, line=dict(color="rgba(100,149,237,0.5)", width=1), name="Upper"))
+        fig_bb.add_trace(go.Scatter(x=lower_f.index, y=lower_f, fill="tonexty",
+                                     fillcolor="rgba(100,149,237,0.07)",
+                                     line=dict(color="rgba(100,149,237,0.5)", width=1), name="Lower"))
+        fig_bb.add_trace(go.Scatter(x=sma20_f.index, y=sma20_f, line=dict(color="#F5A623", width=1.2, dash="dash"), name="SMA20"))
+        fig_bb.add_trace(go.Scatter(x=close_f.index, y=close_f, line=dict(color="#1D9E75", width=1.5), name="Price"))
+        fig_bb.update_layout(height=220, margin=dict(t=10, b=10),
+                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                              yaxis=dict(gridcolor="#30363d"),
+                              legend=dict(orientation="h", y=1.15, font_size=10))
+        st.plotly_chart(fig_bb, use_container_width=True)
+
+    with col_d:
+        st.markdown("##### SMA Trend Structure")
+        st.markdown("""
+**The why:** Moving averages filter out daily noise and reveal the underlying *trend direction*.
+The 200-day SMA is the single most-watched line by institutional investors.
+
+**Every term:**
+- `SMA20` = 20-day average — *short-term* trend; reacts quickly
+- `SMA50` = 50-day average — *medium-term* trend
+- `SMA200` = 200-day average — *long-term* regime indicator
+- **Golden Cross**: SMA50 crosses above SMA200 → institutional buy signal
+- **Death Cross**: SMA50 crosses below SMA200 → institutional sell signal
+- `Price / SMAx − 1` = how far above (+) or below (−) price sits vs. each average
+  (these are features in the ML model, not just visual aids)
+        """)
+        sma50_f  = feat_df["close"].rolling(50).mean().tail(252)
+        sma200_f = feat_df["close"].rolling(200).mean().tail(252)
+        fig_sma = go.Figure()
+        fig_sma.add_trace(go.Scatter(x=close_f.index, y=close_f, line=dict(color="#1D9E75", width=1.5), name="Price"))
+        fig_sma.add_trace(go.Scatter(x=sma20_f.index, y=sma20_f, line=dict(color="#F5A623", width=1.2, dash="dot"), name="SMA 20"))
+        fig_sma.add_trace(go.Scatter(x=sma50_f.index, y=sma50_f, line=dict(color="cornflowerblue", width=1.2, dash="dash"), name="SMA 50"))
+        fig_sma.add_trace(go.Scatter(x=sma200_f.index, y=sma200_f, line=dict(color="#D85A30", width=1.5), name="SMA 200"))
+        fig_sma.update_layout(height=220, margin=dict(t=10, b=10),
+                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                               yaxis=dict(gridcolor="#30363d"),
+                               legend=dict(orientation="h", y=1.15, font_size=10))
+        st.plotly_chart(fig_sma, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — HMM REGIME DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown("#### Market Regime Detection  —  Hidden Markov Model")
+    st.markdown("""
+**The big picture:** Markets don't behave the same way all the time.
+A momentum strategy that works in a low-volatility bull trend can destroy
+wealth in a high-volatility bear regime. The HMM detects which *hidden state*
+the market is most likely in at each point in time.
+
+**What is a Hidden Markov Model?**  
+Think of the market as a machine that flips between invisible modes (regimes).
+You can't directly observe the mode — you can only observe its outputs (daily returns, volatility).
+The HMM reverse-engineers the hidden mode from the observable outputs.
+
+**Every term:**
+- `Hidden State (regime)` = unobservable market mode: Bull, Transitional, or Bear
+- `Observable` = daily log-return + absolute return (|ret|), what the model *sees*
+- `Emission probability` = P(observing this return | we are in state k). Each regime has a characteristic return/vol profile.
+- `Transition matrix` = P(being in state j tomorrow | in state i today). This encodes *persistence* — regimes tend to stick.
+- `Viterbi algorithm` = finds the most likely sequence of hidden states given the full return history.
+- Re-labelling: states are ordered by volatility so Regime 0 = lowest vol (bull), Regime {n-1} = highest (bear).
+    """)
+    st.divider()
+
+    with st.spinner("Fitting HMM…"):
+        spy_ret = np.log(spy / spy.shift(1)).dropna()
+        regimes, hmm_model, remap = fit_hmm(spy_ret, n_regimes=n_regimes)
+
+    # Regime colour bands on SPY price chart
+    spy_aligned = spy.reindex(regimes.index)
+    current_regime = int(regimes.iloc[-1])
+    regime_label   = REGIME_LABELS.get(current_regime, f"Regime {current_regime}")
+    regime_color   = REGIME_COLORS.get(current_regime, "#888")
+
+    st.markdown(
+        f"**Current SPY Regime (today):** "
+        f"<span style='color:{regime_color}; font-weight:700; font-size:1.1rem;'>{regime_label}</span>",
+        unsafe_allow_html=True,
+    )
+
+    # Build shaded regime chart
+    fig_reg = go.Figure()
+    # Background regime shading
+    for reg_id, reg_col in REGIME_COLORS.items():
+        if reg_id >= n_regimes:
+            continue
+        mask = regimes == reg_id
+        # Find contiguous blocks
+        in_block = False
+        block_start = None
+        for date_i, is_in in mask.items():
+            if is_in and not in_block:
+                block_start = date_i
+                in_block = True
+            elif not is_in and in_block:
+                fig_reg.add_vrect(x0=block_start, x1=date_i,
+                                   fillcolor=reg_col, opacity=0.12, line_width=0)
+                in_block = False
+        if in_block:
+            fig_reg.add_vrect(x0=block_start, x1=regimes.index[-1],
+                               fillcolor=reg_col, opacity=0.12, line_width=0)
+
+    fig_reg.add_trace(go.Scatter(x=spy.index, y=spy.values,
+                                  line=dict(color="#c9d1d9", width=1.5), name="SPY"))
+    fig_reg.update_layout(
+        title="SPY Price with HMM Regime Overlay (colour = detected state)",
+        height=360, margin=dict(t=40, b=10),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(showgrid=False),
+        yaxis=dict(title="SPY ($)", gridcolor="#30363d"),
+    )
+    for reg_id, reg_col in REGIME_COLORS.items():
+        if reg_id < n_regimes:
+            fig_reg.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+                                          marker=dict(color=reg_col, size=10, symbol="square"),
+                                          name=REGIME_LABELS[reg_id]))
+    st.plotly_chart(fig_reg, use_container_width=True)
+
+    # Transition matrix heatmap
+    col_trans, col_stats = st.columns(2)
+    with col_trans:
+        st.markdown("##### HMM Transition Matrix")
+        st.markdown("""
+Each cell [i → j] = **probability of moving from Regime i to Regime j tomorrow**.
+High diagonal values (e.g. 0.97) = regimes are *persistent*.
+Off-diagonal values show how likely a regime switch is in any given day.
+        """)
+        trans_mat = hmm_model.transmat_
+        labels    = [REGIME_LABELS[i] for i in range(n_regimes)]
+        fig_trans = px.imshow(
+            trans_mat,
+            x=labels, y=labels,
+            color_continuous_scale="RdYlGn",
+            zmin=0, zmax=1,
+            text_auto=".2f",
+        )
+        fig_trans.update_layout(height=300, margin=dict(t=20, b=10),
+                                 paper_bgcolor="rgba(0,0,0,0)",
+                                 xaxis_title="To Regime", yaxis_title="From Regime")
+        st.plotly_chart(fig_trans, use_container_width=True)
+
+    with col_stats:
+        st.markdown("##### Regime Statistics (SPY)")
+        stat_rows = []
+        spy_ret_aligned = spy_ret.reindex(regimes.index)
+        for r_id in range(n_regimes):
+            mask = regimes == r_id
+            r_returns = spy_ret_aligned[mask]
+            stat_rows.append({
+                "Regime": REGIME_LABELS[r_id],
+                "% of time": f"{mask.mean():.1%}",
+                "Avg daily ret": f"{r_returns.mean():.3%}",
+                "Daily vol": f"{r_returns.std():.3%}",
+                "Ann. return": f"{r_returns.mean() * 252:.1%}",
+                "Ann. vol": f"{r_returns.std() * np.sqrt(252):.1%}",
+                "Sharpe": f"{(r_returns.mean() / r_returns.std() * np.sqrt(252)):.2f}",
+            })
+        st.dataframe(pd.DataFrame(stat_rows).set_index("Regime"), use_container_width=True)
+
+        st.markdown("##### Regime History (last 60 days)")
+        recent_reg = regimes.tail(60)
+        regime_colors_list = [REGIME_COLORS.get(int(v), "#888") for v in recent_reg.values]
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Bar(
+            x=recent_reg.index, y=[1]*len(recent_reg),
+            marker_color=regime_colors_list,
+            hovertext=[REGIME_LABELS.get(int(v), str(v)) for v in recent_reg.values],
+            hoverinfo="x+text",
+        ))
+        fig_hist.update_layout(height=100, margin=dict(t=5, b=5, l=0, r=0),
+                                yaxis=dict(showticklabels=False, showgrid=False),
+                                xaxis=dict(showgrid=False),
+                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                                showlegend=False)
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    st.divider()
+    # Regime-conditioned stock return distributions
+    st.markdown("##### How does the detected regime affect this stock's returns?")
+    st.caption(f"Distribution of {selected_ticker} daily returns conditioned on SPY's HMM regime.")
+    stock_ret = np.log(price_s / price_s.shift(1)).dropna()
+    stock_reg = regimes.reindex(stock_ret.index)
+
+    fig_dist = go.Figure()
+    for r_id in range(n_regimes):
+        mask = stock_reg == r_id
+        r_vals = stock_ret[mask].dropna()
+        fig_dist.add_trace(go.Histogram(
+            x=r_vals, nbinsx=60, name=REGIME_LABELS[r_id],
+            marker_color=REGIME_COLORS[r_id], opacity=0.6,
+            histnorm="probability",
+        ))
+    fig_dist.update_layout(barmode="overlay", height=280, margin=dict(t=20, b=10),
+                            xaxis_title="Daily log-return", yaxis_title="Probability",
+                            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                            legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(fig_dist, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — ML SIGNALS (RF + XGBoost)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.markdown("#### ML Signal Generation  —  Random Forest + XGBoost Ensemble")
+    st.markdown(f"""
+**The big picture:** Classic technical indicators give rules of thumb (RSI > 70 = sell).
+ML models *learn* which combination of indicators — and at what thresholds — actually
+predicted up-moves for *this specific stock* over the *training period*.
+
+**Ensemble approach:** Two models are trained and their probability estimates are averaged:
+- **Random Forest (RF):** builds many decision trees on random subsets of data and features,
+  then averages the results. Robust against overfitting, handles nonlinear patterns.
+- **XGBoost:** builds trees *sequentially*, each correcting the errors of the previous.
+  Tends to perform slightly better on structured financial data.
+- **Soft voting:** instead of a majority vote, we average the *probabilities* — this gives
+  a smoother, more calibrated confidence signal.
+
+**Target variable:** `y = 1` if the stock is up over the next **{lookahead} days** (your lookahead setting).
+**Walk-forward split:** the model trains on the first 70% of history and signals on the last 30%
+— it never sees the future while training.
+    """)
+    st.divider()
+
+    with st.spinner("Training RF + XGBoost model…"):
+        prob_series, importances, train_end, accuracy = train_ml_model(feat_df, lookahead=lookahead)
+
+    # Summary metrics
+    current_prob = float(prob_series.iloc[-1])
+    signal_str   = "BUY signal" if current_prob > 0.55 else ("SELL signal" if current_prob < 0.45 else "NEUTRAL")
+    sig_color    = "#1D9E75" if current_prob > 0.55 else ("#D85A30" if current_prob < 0.45 else "#8b949e")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("P(Up) — Today",    f"{current_prob:.1%}")
+    m2.metric("Signal",           signal_str)
+    m3.metric("OOS Accuracy",     f"{accuracy:.1%}")
+    m4.metric("Trained through",  str(train_end.date()))
+
+    st.markdown(
+        f"**Model verdict:** <span style='color:{sig_color}; font-size:1.1rem; font-weight:700;'>"
+        f"P(stock up in {lookahead}d) = {current_prob:.1%}  →  {signal_str}</span>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "⚠️ This signal reflects learned historical patterns, not a guarantee. "
+        "Always cross-reference with the regime tab and your fundamental view from the BL app."
+    )
+    st.divider()
+
+    col_prob, col_imp = st.columns([3, 2])
+
+    with col_prob:
+        st.markdown(f"##### P(Up in {lookahead}d) — Rolling Signal History")
+        fig_prob = go.Figure()
+        fig_prob.add_hline(y=0.5, line_color="#8b949e", line_dash="dash", opacity=0.6)
+        fig_prob.add_hline(y=0.55, line_color="#1D9E75", line_dash="dot", opacity=0.5, annotation_text="Buy zone")
+        fig_prob.add_hline(y=0.45, line_color="#D85A30", line_dash="dot", opacity=0.5, annotation_text="Sell zone")
+        colors = ["#1D9E75" if p > 0.55 else ("#D85A30" if p < 0.45 else "#F5A623")
+                  for p in prob_series.values]
+        fig_prob.add_trace(go.Scatter(
+            x=prob_series.index, y=prob_series.values,
+            mode="lines", line=dict(color="#c9d1d9", width=1.2), showlegend=False,
+        ))
+        fig_prob.add_trace(go.Scatter(
+            x=prob_series.index, y=prob_series.values,
+            mode="markers", marker=dict(color=colors, size=3), showlegend=False,
+        ))
+        fig_prob.update_layout(height=300, margin=dict(t=20, b=10),
+                                yaxis=dict(title="P(Up)", tickformat=".0%", range=[0, 1], gridcolor="#30363d"),
+                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_prob, use_container_width=True)
+
+        # Signal accuracy per regime
+        if len(regimes) > 0:
+            prob_aligned  = prob_series.copy()
+            reg_aligned   = regimes.reindex(prob_aligned.index)
+            st.markdown("##### Signal Quality by Regime")
+            st.caption("Does the ML signal perform differently in bull vs. bear regimes?")
+            regime_acc = {}
+            stock_ret_oos = np.log(price_s / price_s.shift(lookahead)).shift(-lookahead)
+            actual_up = (stock_ret_oos > 0).reindex(prob_aligned.index)
+            for r_id in range(n_regimes):
+                mask = reg_aligned == r_id
+                if mask.sum() < 10:
+                    continue
+                hits = ((prob_aligned[mask] > 0.5) == actual_up[mask]).dropna()
+                regime_acc[REGIME_LABELS[r_id]] = {
+                    "Days in regime (test set)": int(mask.sum()),
+                    "Signal accuracy": f"{hits.mean():.1%}" if len(hits) > 0 else "N/A",
+                }
+            if regime_acc:
+                st.dataframe(pd.DataFrame(regime_acc).T, use_container_width=True)
+
+    with col_imp:
+        st.markdown("##### Feature Importances — Why does the model signal this?")
+        st.markdown("""
+Feature importance = how much each feature reduces prediction error across all decision trees.
+Higher = more relied upon. This answers the **"why"** behind the signal.
+        """)
+        top_n = 10
+        top_imp = importances.head(top_n)
+        fig_imp = go.Figure(go.Bar(
+            y=top_imp.index[::-1],
+            x=top_imp.values[::-1],
+            orientation="h",
+            marker=dict(
+                color=top_imp.values[::-1],
+                colorscale=[[0, "#30363d"], [1, "#1D9E75"]],
+            ),
+        ))
+        fig_imp.update_layout(height=360, margin=dict(t=20, b=10, l=10, r=10),
+                               xaxis=dict(title="Avg importance", gridcolor="#30363d"),
+                               yaxis=dict(tickfont=dict(size=11)),
+                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_imp, use_container_width=True)
+
+        # Plain-English explanation for the top 3
+        st.markdown("**Top 3 drivers — in plain English:**")
+        for feat in importances.head(3).index:
+            glos = FEATURE_GLOSSARY.get(feat, (feat, "", ""))
+            st.markdown(f"- **{glos[0]}** (`{feat}`): {glos[2]}")
+
+    st.divider()
+    with st.expander("📊 Full feature importance table"):
+        imp_df = importances.reset_index()
+        imp_df.columns = ["Feature", "Importance"]
+        imp_df["Name"]    = imp_df["Feature"].map(lambda f: FEATURE_GLOSSARY.get(f, (f,))[0])
+        imp_df["Meaning"] = imp_df["Feature"].map(lambda f: FEATURE_GLOSSARY.get(f, ("","",""))[2])
+        st.dataframe(imp_df.set_index("Feature").style.format({"Importance": "{:.4f}"}),
+                     use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — LSTM FORECAST
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown("#### LSTM Price Forecast  —  Deep Sequence Learning")
+    st.markdown(f"""
+**The big picture:** LSTM (Long Short-Term Memory) is a type of recurrent neural network
+designed for *sequential data*. Unlike RF/XGBoost which treat each day independently,
+the LSTM reads a *window* of the past {30} trading days as a sequence and learns which
+temporal patterns precede up/down moves.
+
+**Architecture (every layer explained):**
+- `Input`: the last **30 days** of [normalised price, 5-day vol, RSI] — a (30, 3) tensor
+- `LSTM(64)`: 64 memory units, each maintaining a *hidden state* that summarises past observations.
+  The key innovation: LSTM has **forget gates** — it learns *what to remember and what to ignore*
+  across time steps. This lets it capture both short-term momentum and longer-term reversals.
+  - `h_t` (hidden state) = what the LSTM passes forward to the next time step
+  - `c_t` (cell state)   = the long-term memory carried across many steps
+  - `σ` (sigmoid gates)  = decide how much old memory to *forget* vs. how much new info to *add*
+- `Dropout(0.2)`: randomly zeros 20% of neurons during training — reduces overfitting
+- `Dense(32) → Dense(1)`: maps the LSTM's final hidden state to a scalar: the predicted
+  **{lstm_horizon}-day forward log-return**
+
+**Walk-forward:** trains on first 70% of data, forecasts out-of-sample on last 30%.
+Normalisation per window (divide by first value) makes the model learn *shape* not levels.
+    """)
+    st.divider()
+
+    with st.spinner("Training LSTM… (this takes ~15–30 seconds on first run)"):
+        lstm_preds, lstm_actuals, lstm_train_end = train_lstm(
+            price_s, seq_len=30, horizon=lstm_horizon, epochs=30
+        )
+
+    # Align and compute metrics
+    compare = pd.DataFrame({"Predicted": lstm_preds, "Actual": lstm_actuals}).dropna()
+    directional_acc = ((compare["Predicted"] > 0) == (compare["Actual"] > 0)).mean()
+    corr = compare.corr().iloc[0, 1]
+    latest_pred = float(lstm_preds.iloc[-1])
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Next-horizon pred",      f"{latest_pred:+.2%}",
+              "↑ Up" if latest_pred > 0 else "↓ Down")
+    m2.metric("Directional accuracy",   f"{directional_acc:.1%}")
+    m3.metric("Pred-actual correlation",f"{corr:.2f}")
+    m4.metric("Trained through",        str(lstm_train_end.date()))
+
+    st.divider()
+    col_fc, col_err = st.columns([3, 2])
+
+    with col_fc:
+        st.markdown(f"##### Predicted vs. Actual {lstm_horizon}-Day Return (out-of-sample)")
+        fig_lstm = go.Figure()
+        fig_lstm.add_hline(y=0, line_color="#30363d")
+        fig_lstm.add_trace(go.Scatter(x=compare.index, y=compare["Actual"],
+                                       line=dict(color="#8b949e", width=1.2), name="Actual"))
+        fig_lstm.add_trace(go.Scatter(x=compare.index, y=compare["Predicted"],
+                                       line=dict(color="#1D9E75", width=1.5, dash="dash"),
+                                       name="LSTM Prediction"))
+        fig_lstm.update_layout(
+            height=300, margin=dict(t=20, b=10),
+            yaxis=dict(tickformat=".1%", gridcolor="#30363d"),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=1.1),
+        )
+        st.plotly_chart(fig_lstm, use_container_width=True)
+
+    with col_err:
+        st.markdown("##### Prediction Error Distribution")
+        errors = compare["Predicted"] - compare["Actual"]
+        fig_err = go.Figure()
+        fig_err.add_trace(go.Histogram(x=errors, nbinsx=50,
+                                        marker_color="#1D9E75", opacity=0.75))
+        fig_err.add_vline(x=0, line_color="#D85A30", line_dash="dash")
+        fig_err.update_layout(height=200, margin=dict(t=20, b=10),
+                               xaxis=dict(title="Prediction error (log-return)", tickformat=".1%"),
+                               yaxis=dict(title="Count"),
+                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_err, use_container_width=True)
+
+        st.markdown("##### Performance Summary")
+        mae  = float(errors.abs().mean())
+        rmse = float(np.sqrt((errors ** 2).mean()))
+        st.dataframe(pd.DataFrame({
+            "Metric": ["MAE", "RMSE", "Directional Acc", "Correlation"],
+            "Value":  [f"{mae:.3%}", f"{rmse:.3%}", f"{directional_acc:.1%}", f"{corr:.3f}"],
+        }).set_index("Metric"), use_container_width=True)
+
+    st.divider()
+
+    # How the architecture applies here
+    with st.expander("🧠 Understanding the LSTM Architecture — term by term"):
+        st.markdown("""
+| Term | What it is | Why it matters here |
+|------|-----------|---------------------|
+| `Sequence input (30, 3)` | The last 30 rows of [price, vol, RSI] | The LSTM needs a window of history, not just today's snapshot |
+| `LSTM hidden state h_t` | A vector summarising what the LSTM "remembers" | Carries forward learned patterns like "volatility has been falling for 10 days" |
+| `Cell state c_t` | Long-term memory | Allows the model to remember conditions from 20+ days ago |
+| `Forget gate σ_f` | Sigmoid deciding what to discard | Lets the model forget irrelevant old patterns during a regime change |
+| `Input gate σ_i` | Sigmoid deciding what new info to write | Selectively adds today's return/vol to the cell state |
+| `Output gate σ_o` | Sigmoid deciding what to expose | Controls how much of the cell state influences the prediction |
+| `Dropout(0.2)` | 20% neurons zeroed randomly in training | Prevents memorisation; forces generalisation |
+| `Dense(1)` output | Single scalar: predicted log-return | Directly forecastable; >0 = predicted up, <0 = predicted down |
+        """)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — UNIVERSE SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown("#### Universe Scanner  —  All 17 Stocks at a Glance")
+    st.markdown(
+        "Daily snapshot of key technical signals across the full portfolio universe. "
+        "Pairs with the BL app: if the BL allocates 20% to NVDA but the scanner shows "
+        "a bear regime + overbought RSI, that's a prompt to re-examine the near-term entry timing."
+    )
+    st.divider()
+
+    with st.spinner("Computing signals for all 17 tickers…"):
+        scanner_rows = []
+        for t in TICKERS:
+            if t not in closes.columns or t not in volumes.columns:
+                continue
+            try:
+                p  = closes[t].dropna()
+                v  = volumes[t].dropna()
+                fd = compute_features(p, v)
+                last_fd = fd.iloc[-1]
+                daily_r = float(p.iloc[-1] / p.iloc[-2] - 1)
+
+                # Quick RSI signal
+                rsi_val = last_fd["rsi_14"]
+                rsi_sig = "🟢 Oversold" if rsi_val < 30 else ("🔴 OB" if rsi_val > 70 else "–")
+
+                # MACD direction
+                macd_sig = "↑" if last_fd["macd_hist"] > 0 else "↓"
+
+                # Vol regime
+                vol_sig = "High" if last_fd["vol_ratio"] > 1.2 else "Normal"
+
+                # SMA position
+                sma_sig = "Above 200" if last_fd["price_vs_sma200"] > 0 else "Below 200"
+
+                scanner_rows.append({
+                    "Ticker":         t,
+                    "Last Price":     float(p.iloc[-1]),
+                    "1D Ret":         daily_r,
+                    "1M Ret":         float(last_fd["ret_21d"]),
+                    "RSI (14)":       float(rsi_val),
+                    "RSI Signal":     rsi_sig,
+                    "MACD":           macd_sig,
+                    "Vol Regime":     vol_sig,
+                    "vs SMA 200":     float(last_fd["price_vs_sma200"]),
+                    "SMA Trend":      sma_sig,
+                    "BB %B":          float(last_fd["bb_pct"]),
+                    "52W High Dist":  float(last_fd["high_52w_pct"]),
+                })
+            except Exception:
+                pass
+
+    scan_df = pd.DataFrame(scanner_rows).set_index("Ticker")
+
+    def color_ret(v):
+        if isinstance(v, float):
+            return "color: #1D9E75" if v > 0 else "color: #D85A30" if v < 0 else ""
+        return ""
+
+    styled_scan = (
+        scan_df.style
+        .format({
+            "Last Price":  "${:,.2f}",
+            "1D Ret":      "{:+.2%}",
+            "1M Ret":      "{:+.2%}",
+            "RSI (14)":    "{:.1f}",
+            "vs SMA 200":  "{:+.1%}",
+            "BB %B":       "{:.2f}",
+            "52W High Dist": "{:.1%}",
+        })
+        .applymap(color_ret, subset=["1D Ret", "1M Ret", "vs SMA 200", "52W High Dist"])
+        .background_gradient(subset=["RSI (14)"], cmap="RdYlGn_r", vmin=20, vmax=80)
+        .background_gradient(subset=["BB %B"],    cmap="RdYlGn_r", vmin=0, vmax=1)
+    )
+    st.dataframe(styled_scan, use_container_width=True, height=680,
+                 column_config={
+                     "RSI Signal":  st.column_config.TextColumn("RSI Signal", width="small"),
+                     "MACD":        st.column_config.TextColumn("MACD ↑/↓", width="small"),
+                     "Vol Regime":  st.column_config.TextColumn("Vol", width="small"),
+                     "SMA Trend":   st.column_config.TextColumn("vs SMA200", width="medium"),
+                 })
+
+    st.divider()
+    st.markdown("##### 1-Month Return  vs.  RSI — Momentum Map")
+    st.caption("Each bubble = one stock. X-axis = RSI (potential overbought/oversold), "
+               "Y-axis = 1-month return. Top-left = strong returns but not yet overbought.")
+    fig_map = px.scatter(
+        scan_df.reset_index(), x="RSI (14)", y="1M Ret", text="Ticker",
+        color="Vol Regime",
+        color_discrete_map={"High": "#D85A30", "Normal": "#1D9E75"},
+        size_max=14,
+    )
+    fig_map.add_vline(x=70, line_dash="dot", line_color="#D85A30", opacity=0.5)
+    fig_map.add_vline(x=30, line_dash="dot", line_color="#1D9E75", opacity=0.5)
+    fig_map.add_hline(y=0,  line_dash="dash", line_color="#8b949e", opacity=0.4)
+    fig_map.update_traces(textposition="top center", marker=dict(size=14))
+    fig_map.update_layout(
+        height=420, margin=dict(t=30, b=10),
+        yaxis=dict(tickformat=".0%", title="1-Month Return", gridcolor="#30363d"),
+        xaxis=dict(title="RSI (14) — today"),
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — REBALANCING PLANNER
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.markdown("#### 💼 Rebalancing Planner")
+    st.markdown(
+        "This tab bridges the **Portfolio Optimiser (DCF-BL)** app and the daily technical signals. "
+        "Enter your BL target weights and current holdings below. The planner computes the exact "
+        "trades needed, estimates their all-in cost at your scale, and cross-checks each trade "
+        "against the regime, ML signal, and technical indicators — so you know not just *what* "
+        "to trade, but *whether now is a good time to execute it*."
+    )
+
+    # ── SLIPPAGE MODEL ────────────────────────────────────────────────────────
+    # For a $25k retail portfolio in large-cap US tech, transaction costs break
+    # down into three components:
+    #
+    #   1. Commission:  $0 on Moo Moo (commission-free)
+    #   2. Bid-ask spread: half-spread × trade value.
+    #      Estimated as spread_bps × price / 2 per share.
+    #      For liquid mega-caps: ~1–3 bps. We calibrate per ticker.
+    #   3. Slippage (open-gap cost): the difference between yesterday's close
+    #      (the signal price) and tomorrow's open (your actual fill).
+    #      Estimated as: slip_fraction × ATR_14
+    #      where ATR_14 is the 14-day average true range — it captures how
+    #      large a typical intraday move is for this stock.
+    #      For market orders on liquid names: slip_fraction ≈ 0.10–0.15.
+    #      i.e. you expect to fill within 10–15% of the daily range from close.
+    #
+    # Total cost per trade = spread_cost + slippage_cost
+    # Total cost as % of trade = (spread_cost + slippage_cost) / trade_value
+
+    # Spread estimates in basis points (1 bp = 0.01%) — calibrated for retail
+    # order flow on these specific tickers. Tighter for higher-volume US names,
+    # wider for ADRs (TSM, ASML) where retail spreads are structurally higher.
+    SPREAD_BPS = {
+        "AAPL": 1.0, "ADBE": 1.5, "AMAT": 1.5, "AMZN": 1.0, "ASML": 3.5,
+        "SPGI": 2.0, "FICO": 2.5, "GOOGL": 1.0, "LRCX": 2.0, "MA":   1.5,
+        "META": 1.0, "MSCI": 2.5, "MSFT": 1.0, "NFLX": 1.5, "NVDA": 1.0,
+        "TSM":  2.5, "V":   1.5,
+    }
+    SLIP_FRACTION = 0.12   # 12% of ATR_14 — conservative estimate for market orders
+
+    def estimate_trade_cost(ticker: str, trade_value: float, feat_df: pd.DataFrame) -> dict:
+        """
+        Estimate the all-in cost of executing one trade.
+
+        Parameters
+        ----------
+        ticker      : stock ticker
+        trade_value : absolute USD value of the trade (positive = buy, negative = sell)
+        feat_df     : feature DataFrame for this ticker (needs 'close', 'atr_14')
+
+        Returns
+        -------
+        dict with:
+          spread_cost   : estimated bid-ask spread cost in USD
+          slippage_cost : estimated open-gap slippage cost in USD
+          total_cost    : total in USD
+          total_pct     : total as % of trade value
+          breakeven_days: how many days of expected return needed to recover the cost
+                          (using 21d annualised vol as a proxy for daily expected move)
+        """
+        abs_val   = abs(trade_value)
+        if abs_val < 1:
+            return {"spread_cost": 0, "slippage_cost": 0,
+                    "total_cost": 0, "total_pct": 0, "breakeven_days": 0}
+
+        price     = float(feat_df["close"].iloc[-1])
+        atr       = float(feat_df["atr_14"].iloc[-1])
+        spread_bp = SPREAD_BPS.get(ticker, 2.0)
+
+        # Half-spread cost: you pay half the spread on entry and half on exit.
+        # We only model entry cost here (the exit is a future tab problem).
+        spread_cost   = abs_val * (spread_bp / 10_000) * 0.5
+
+        # Slippage: SLIP_FRACTION × ATR_14 per share × number of shares
+        n_shares      = abs_val / price
+        slippage_cost = n_shares * SLIP_FRACTION * atr
+
+        total_cost = spread_cost + slippage_cost
+        total_pct  = total_cost / abs_val if abs_val > 0 else 0
+
+        # Breakeven: daily vol × price × n_shares gives the daily $ P&L noise.
+        # breakeven_days = cost / (daily_vol × abs_val)
+        daily_vol   = float(feat_df["vol_21"].iloc[-1]) / np.sqrt(252)
+        breakeven_d = total_pct / daily_vol if daily_vol > 0 else 0
+
+        return {
+            "spread_cost":    round(spread_cost,    2),
+            "slippage_cost":  round(slippage_cost,  2),
+            "total_cost":     round(total_cost,     2),
+            "total_pct":      round(total_pct,      6),
+            "breakeven_days": round(breakeven_d,    1),
+        }
+
+    def score_entry_timing(ticker: str, feat_df: pd.DataFrame,
+                           regime: int, prob_up: float | None,
+                           direction: str) -> tuple[str, str, str]:
+        """
+        Synthesise regime + ML signal + technicals into a timing verdict.
+
+        Parameters
+        ----------
+        direction : "BUY" or "SELL"
+
+        Returns (verdict, colour, reasoning)
+        -------
+        verdict   : "Execute now" / "Wait for better entry" / "Proceed with caution"
+        colour    : hex colour for the badge
+        reasoning : one-sentence plain-English explanation
+        """
+        last = feat_df.iloc[-1]
+        rsi  = float(last["rsi_14"])
+        macd = float(last["macd_hist"])
+        vs200 = float(last["price_vs_sma200"])
+        bb   = float(last["bb_pct"])
+        regime_label = REGIME_LABELS.get(regime, "Unknown")
+
+        signals = []   # positive = favours the trade direction
+
+        if direction == "BUY":
+            signals.append(+1 if regime == 0 else (-1 if regime == 2 else 0))  # bull regime
+            signals.append(+1 if rsi < 55 else (-1 if rsi > 70 else 0))        # not overbought
+            signals.append(+1 if macd > 0 else -1)                              # momentum
+            signals.append(+1 if vs200 > 0 else -1)                             # above 200-SMA
+            signals.append(+1 if bb < 0.8 else -1)                              # not at upper band
+            if prob_up is not None:
+                signals.append(+1 if prob_up > 0.55 else (-1 if prob_up < 0.45 else 0))
+        else:  # SELL
+            signals.append(-1 if regime == 0 else (+1 if regime == 2 else 0))
+            signals.append(+1 if rsi > 60 else (-1 if rsi < 35 else 0))
+            signals.append(+1 if macd < 0 else -1)
+            signals.append(+1 if vs200 < 0 else -1)
+            signals.append(+1 if bb > 0.6 else -1)
+            if prob_up is not None:
+                signals.append(+1 if prob_up < 0.45 else (-1 if prob_up > 0.55 else 0))
+
+        score = sum(signals) / len(signals)   # normalised: +1 = all signals agree, -1 = all oppose
+
+        if score >= 0.4:
+            verdict = "✅ Execute now"
+            colour  = "#1D9E75"
+            reason  = (f"Signals broadly favour a {direction.lower()} "
+                       f"in the current {regime_label} regime.")
+        elif score >= 0.0:
+            verdict = "⚠️ Proceed with caution"
+            colour  = "#F5A623"
+            reason  = (f"Mixed signals — regime is {regime_label}, "
+                       f"but some technical indicators are working against a {direction.lower()}.")
+        else:
+            verdict = "🔴 Wait for better entry"
+            colour  = "#D85A30"
+            reason  = (f"Most signals oppose a {direction.lower()} here. "
+                       f"Regime: {regime_label}. Consider waiting for a pullback or confirmation.")
+
+        return verdict, colour, reason
+
+    # ── SECTION 0: Holdings Tracker (persistent across sessions) ─────────────
+    st.divider()
+    st.markdown("### 1. Current Holdings")
+    st.markdown(
+        "Enter your current positions below. These are saved to session state and "
+        "persist as long as the browser tab is open. **Shares** = what you hold today."
+    )
+
+    # Initialise holdings in session state
+    if "holdings" not in st.session_state:
+        st.session_state.holdings = {t: 0.0 for t in TICKERS}
+
+    # Holdings input grid — 4 columns
+    cols_per_row = 4
+    tickers_list = TICKERS
+    for row_start in range(0, len(tickers_list), cols_per_row):
+        row_tickers = tickers_list[row_start: row_start + cols_per_row]
+        row_cols    = st.columns(cols_per_row)
+        for col, t in zip(row_cols, row_tickers):
+            with col:
+                price_now = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
+                shares    = col.number_input(
+                    f"{t}  (${price_now:,.0f}/sh)",
+                    min_value=0.0, value=float(st.session_state.holdings.get(t, 0.0)),
+                    step=0.1, key=f"hold_{t}",
+                )
+                st.session_state.holdings[t] = shares
+
+    # Compute current portfolio value from holdings
+    current_values = {}
+    for t in TICKERS:
+        shares    = st.session_state.holdings.get(t, 0.0)
+        price_now = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
+        current_values[t] = shares * price_now
+
+    total_portfolio_value = sum(current_values.values())
+    cash_outside = max(0.0, 25_000 - total_portfolio_value)  # placeholder
+
+    # Allow user to override total portfolio size
+    st.divider()
+    col_pf1, col_pf2, col_pf3 = st.columns(3)
+    portfolio_size = col_pf1.number_input(
+        "Total deployable capital (USD)",
+        min_value=1_000.0, value=max(total_portfolio_value, 25_000.0),
+        step=500.0,
+        help="Your total capital to allocate — including cash. "
+             "Defaults to $25,000 or the sum of your holdings, whichever is larger.",
+    )
+    col_pf2.metric("Current invested", f"${total_portfolio_value:,.0f}")
+    col_pf3.metric("Estimated cash", f"${max(portfolio_size - total_portfolio_value, 0):,.0f}")
+
+    # Show current allocation
+    if total_portfolio_value > 0:
+        with st.expander("📊 Current allocation breakdown", expanded=False):
+            curr_alloc = {t: v / portfolio_size for t, v in current_values.items() if v > 0}
+            curr_df = pd.DataFrame({
+                "Ticker":      list(curr_alloc.keys()),
+                "Shares":      [st.session_state.holdings[t] for t in curr_alloc],
+                "Price":       [float(closes[t].iloc[-1]) for t in curr_alloc],
+                "Market Value": [current_values[t] for t in curr_alloc],
+                "Current Wt":  list(curr_alloc.values()),
+            }).set_index("Ticker").sort_values("Market Value", ascending=False)
+            st.dataframe(
+                curr_df.style
+                .format({"Price": "${:,.2f}", "Market Value": "${:,.2f}", "Current Wt": "{:.2%}"}),
+                use_container_width=True,
+            )
+
+    # ── SECTION 1: BL Target Weights Input ───────────────────────────────────
+    st.divider()
+    st.markdown("### 2. BL Target Weights")
+    st.markdown(
+        "Enter the **BL Optimised** weights from the Portfolio Optimiser app. "
+        "Tickers with zero weight in BL will appear as full sells if you currently hold them."
+    )
+    st.caption(
+        "💡 Tip: copy the 'BL Optimised' column from the Views, Returns & Weights tab "
+        "of the Portfolio Optimiser app directly into these fields."
+    )
+
+    if "bl_weights" not in st.session_state:
+        # Sensible placeholder defaults (equal weight across 6 high-conviction names)
+        st.session_state.bl_weights = {t: 0.0 for t in TICKERS}
+
+    bl_cols_per_row = 4
+    for row_start in range(0, len(tickers_list), bl_cols_per_row):
+        row_tickers = tickers_list[row_start: row_start + bl_cols_per_row]
+        row_cols    = st.columns(bl_cols_per_row)
+        for col, t in zip(row_cols, row_tickers):
+            with col:
+                wt = col.number_input(
+                    f"{t} BL wt (%)",
+                    min_value=0.0, max_value=100.0,
+                    value=float(st.session_state.bl_weights.get(t, 0.0)) * 100,
+                    step=0.5, key=f"bl_{t}",
+                )
+                st.session_state.bl_weights[t] = wt / 100
+
+    bl_total = sum(st.session_state.bl_weights.values())
+    if abs(bl_total - 1.0) > 0.02 and bl_total > 0:
+        st.warning(f"⚠️ BL weights sum to **{bl_total:.1%}** — should be ~100%. "
+                   "Check your inputs from the Portfolio Optimiser.")
+    elif bl_total > 0:
+        st.success(f"✅ BL weights sum to {bl_total:.1%}")
+
+    # ── SECTION 2: Trade List + Cost Estimates ────────────────────────────────
+    st.divider()
+    st.markdown("### 3. Required Trades & Cost Estimates")
+    st.markdown("""
+**How the cost model works — every term:**
+
+- **Trade value** = (BL target weight − current weight) × total portfolio size
+  — positive = buy more, negative = sell
+- **Spread cost** = half the bid-ask spread × trade value.
+  The spread is the gap between the best buy and best sell price in the market.
+  You pay half of it on entry (the other half when you eventually exit).
+  Estimated as `spread_bps × trade_value / 2` where spread_bps is calibrated
+  per ticker (tighter for US mega-caps, wider for ADRs like ASML and TSM).
+- **Slippage** = the gap between yesterday's closing price (when the signal fires)
+  and tomorrow's opening price (when you actually execute).
+  Estimated as `12% × ATR_14 per share × number of shares`.
+  ATR_14 (Average True Range) is the 14-day average of daily price ranges —
+  it tells you how much the stock typically moves in a day.
+  12% of that range is a conservative estimate of where your market order fills
+  relative to the prior close for a liquid large-cap.
+- **Break-even days** = how many trading days of expected price movement are
+  needed to recover the round-trip cost. Calculated as `total_cost_pct / daily_vol`.
+  A break-even of 0.5 days means the cost is trivially small.
+  A break-even of 3+ days means the trade needs to be very right to be worth it.
+    """)
+
+    if bl_total == 0:
+        st.info("Enter your BL target weights above to generate the trade list.")
+    else:
+        trade_rows = []
+        for t in TICKERS:
+            target_wt   = st.session_state.bl_weights.get(t, 0.0)
+            current_wt  = current_values.get(t, 0.0) / portfolio_size
+            delta_wt    = target_wt - current_wt
+            trade_val   = delta_wt * portfolio_size
+
+            if abs(trade_val) < 10:   # ignore rounding noise
+                continue
+
+            direction  = "BUY" if trade_val > 0 else "SELL"
+            price_now  = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
+            n_shares   = abs(trade_val) / price_now if price_now > 0 else 0
+
+            # Feature data for cost model
+            try:
+                fd = compute_features(closes[t].dropna(), volumes[t].dropna())
+                costs = estimate_trade_cost(t, trade_val, fd)
+            except Exception:
+                costs = {"spread_cost": 0, "slippage_cost": 0,
+                         "total_cost": 0, "total_pct": 0, "breakeven_days": 0}
+
+            trade_rows.append({
+                "Ticker":         t,
+                "Direction":      direction,
+                "Current Wt":     current_wt,
+                "Target Wt":      target_wt,
+                "Δ Weight":       delta_wt,
+                "Trade Value ($)": trade_val,
+                "Shares":         round(n_shares, 2),
+                "Spread Cost ($)": costs["spread_cost"],
+                "Slippage ($)":   costs["slippage_cost"],
+                "Total Cost ($)": costs["total_cost"],
+                "Cost (%)":       costs["total_pct"],
+                "Break-even (days)": costs["breakeven_days"],
+            })
+
+        if not trade_rows:
+            st.success("✅ Portfolio is already at target weights — no trades required.")
+        else:
+            trade_df = pd.DataFrame(trade_rows).set_index("Ticker")
+            total_cost_usd = trade_df["Total Cost ($)"].sum()
+            total_trade_vol = trade_df["Trade Value ($)"].abs().sum()
+            avg_cost_pct    = total_cost_usd / total_trade_vol if total_trade_vol > 0 else 0
+
+            # Summary metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Trades required",   len(trade_rows))
+            m2.metric("Total trade volume", f"${total_trade_vol:,.0f}")
+            m3.metric("Est. total cost",    f"${total_cost_usd:,.2f}")
+            m4.metric("Avg cost as % of trades", f"{avg_cost_pct:.3%}")
+
+            def highlight_direction(val):
+                if val == "BUY":  return "color: #1D9E75; font-weight:600"
+                if val == "SELL": return "color: #D85A30; font-weight:600"
+                return ""
+
+            def color_delta(val):
+                if isinstance(val, float):
+                    return "color: #1D9E75" if val > 0 else "color: #D85A30"
+                return ""
+
+            styled_trades = (
+                trade_df.style
+                .format({
+                    "Current Wt":      "{:.2%}",
+                    "Target Wt":       "{:.2%}",
+                    "Δ Weight":        "{:+.2%}",
+                    "Trade Value ($)": "${:+,.0f}",
+                    "Shares":          "{:.2f}",
+                    "Spread Cost ($)": "${:.2f}",
+                    "Slippage ($)":    "${:.2f}",
+                    "Total Cost ($)":  "${:.2f}",
+                    "Cost (%)":        "{:.3%}",
+                    "Break-even (days)": "{:.1f}d",
+                })
+                .applymap(highlight_direction, subset=["Direction"])
+                .applymap(color_delta, subset=["Δ Weight", "Trade Value ($)"])
+                .background_gradient(subset=["Cost (%)"], cmap="YlOrRd", vmin=0, vmax=0.003)
+                .background_gradient(subset=["Break-even (days)"], cmap="YlOrRd", vmin=0, vmax=3)
+            )
+            st.dataframe(styled_trades, use_container_width=True)
+
+            # ── SECTION 3: Entry Timing Verdicts ─────────────────────────────
+            st.divider()
+            st.markdown("### 4. Entry Timing — Should You Execute Each Trade Today?")
+            st.markdown(
+                "Each trade is cross-checked against three layers of signal: "
+                "the HMM market regime, the ML probability-of-up, and the technical indicators. "
+                "The verdict is a synthesis — not any single signal in isolation."
+            )
+
+            # We need the current regime from SPY HMM
+            # Re-use fitted HMM from Tab 2 if already computed, else refit
+            try:
+                spy_ret_plan = np.log(spy / spy.shift(1)).dropna()
+                regimes_plan, _, _ = fit_hmm(spy_ret_plan, n_regimes=n_regimes)
+                current_regime_plan = int(regimes_plan.iloc[-1])
+            except Exception:
+                current_regime_plan = 1   # fallback: transitional
+
+            regime_now_label = REGIME_LABELS.get(current_regime_plan, "Unknown")
+            regime_now_color = REGIME_COLORS.get(current_regime_plan, "#888")
+
+            st.markdown(
+                f"**Current market regime (SPY HMM):** "
+                f"<span style='color:{regime_now_color}; font-weight:700;'>{regime_now_label}</span>",
+                unsafe_allow_html=True,
+            )
+
+            verdict_rows = []
+            for t in trade_df.index:
+                direction = trade_df.loc[t, "Direction"]
+                try:
+                    fd_t   = compute_features(closes[t].dropna(), volumes[t].dropna())
+                    prob_s, _, _, _ = train_ml_model(fd_t, lookahead=lookahead)
+                    prob_up_now = float(prob_s.iloc[-1])
+                except Exception:
+                    prob_up_now = None
+
+                try:
+                    fd_t = compute_features(closes[t].dropna(), volumes[t].dropna())
+                except Exception:
+                    continue
+
+                verdict, v_color, reason = score_entry_timing(
+                    t, fd_t, current_regime_plan, prob_up_now, direction
+                )
+
+                last_fd  = fd_t.iloc[-1]
+                verdict_rows.append({
+                    "Ticker":       t,
+                    "Direction":    direction,
+                    "Verdict":      verdict,
+                    "Regime":       regime_now_label,
+                    "P(Up) ML":     f"{prob_up_now:.1%}" if prob_up_now is not None else "N/A",
+                    "RSI":          f"{last_fd['rsi_14']:.1f}",
+                    "MACD":         "↑" if last_fd["macd_hist"] > 0 else "↓",
+                    "vs SMA200":    f"{last_fd['price_vs_sma200']:+.1%}",
+                    "Reasoning":    reason,
+                    "_color":       v_color,
+                })
+
+            if verdict_rows:
+                # Priority sort: execute now first, then caution, then wait
+                priority = {"✅ Execute now": 0, "⚠️ Proceed with caution": 1,
+                            "🔴 Wait for better entry": 2}
+                verdict_rows.sort(key=lambda r: priority.get(r["Verdict"], 3))
+
+                verdict_df = pd.DataFrame(verdict_rows).set_index("Ticker")
+                verdict_display = verdict_df.drop(columns=["_color"])
+
+                def style_verdict(val):
+                    if "Execute" in str(val):   return "color: #1D9E75; font-weight:600"
+                    if "caution" in str(val):   return "color: #F5A623; font-weight:600"
+                    if "Wait"    in str(val):   return "color: #D85A30; font-weight:600"
+                    return ""
+
+                styled_verdict = (
+                    verdict_display.style
+                    .applymap(style_verdict, subset=["Verdict"])
+                    .applymap(highlight_direction, subset=["Direction"])
+                )
+                st.dataframe(styled_verdict, use_container_width=True,
+                             column_config={
+                                 "Reasoning": st.column_config.TextColumn(
+                                     "Reasoning", width="large"),
+                                 "Verdict":   st.column_config.TextColumn(
+                                     "Verdict", width="medium"),
+                             })
+
+            # ── SECTION 4: Rebalancing Waterfall ──────────────────────────────
+            st.divider()
+            st.markdown("### 5. Capital Redeployment Waterfall")
+            st.caption(
+                "Visualises the weight shift from current to target allocation. "
+                "Net of estimated transaction costs."
+            )
+
+            tickers_sorted = trade_df.sort_values("Δ Weight").index.tolist()
+            deltas = [float(trade_df.loc[t, "Δ Weight"]) for t in tickers_sorted]
+            colors = [REGIME_COLORS[0] if d > 0 else REGIME_COLORS[2] for d in deltas]
+
+            fig_wf = go.Figure()
+            fig_wf.add_trace(go.Bar(
+                y=tickers_sorted, x=deltas, orientation="h",
+                marker_color=colors, opacity=0.85,
+                hovertemplate="<b>%{y}</b><br>Δ Weight: %{x:.2%}<extra></extra>",
+            ))
+            fig_wf.add_vline(x=0, line_color="#30363d", line_width=1)
+            fig_wf.update_layout(
+                height=max(250, len(tickers_sorted) * 32),
+                xaxis=dict(title="Weight change", tickformat=".1%", gridcolor="#30363d"),
+                yaxis=dict(autorange="reversed"),
+                margin=dict(t=20, b=20, l=10, r=10),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_wf, use_container_width=True)
+
+            # ── SECTION 5: Cost Impact Summary ────────────────────────────────
+            st.divider()
+            st.markdown("### 6. Full Cost Breakdown")
+            with st.expander("📐 Understand every cost term", expanded=False):
+                st.markdown("""
+| Term | Definition | Your context |
+|------|-----------|-------------|
+| **Commission** | Fee per trade | $0 on Moo Moo |
+| **Bid-ask spread** | Gap between best buy and sell price in the market | ~1–3 bps for US mega-caps; ~3.5 bps for ASML/TSM (ADRs). You pay **half** the spread on entry. |
+| **Slippage** | Gap between yesterday's closing price and your actual fill at market open | Estimated as 12% × ATR_14. ATR_14 is the 14-day average daily price range — your order fills somewhere within it. |
+| **Market impact** | Your order moves the price against you | **Zero** at $25k in stocks with $5B+ daily volume. You are invisible to the market. |
+| **Break-even days** | Trading days of price movement needed to recover round-trip costs | Calculated as total_cost_pct ÷ daily_vol. Anything under 1 day is negligible. |
+                """)
+
+            cost_breakdown = trade_df[["Direction", "Trade Value ($)",
+                                        "Spread Cost ($)", "Slippage ($)",
+                                        "Total Cost ($)", "Cost (%)",
+                                        "Break-even (days)"]].copy()
+
+            # Add a totals row
+            totals = pd.Series({
+                "Direction":         "—",
+                "Trade Value ($)":   trade_df["Trade Value ($)"].abs().sum(),
+                "Spread Cost ($)":   trade_df["Spread Cost ($)"].sum(),
+                "Slippage ($)":      trade_df["Slippage ($)"].sum(),
+                "Total Cost ($)":    trade_df["Total Cost ($)"].sum(),
+                "Cost (%)":          avg_cost_pct,
+                "Break-even (days)": (trade_df["Break-even (days)"] *
+                                       trade_df["Trade Value ($)"].abs()).sum() /
+                                      total_trade_vol if total_trade_vol > 0 else 0,
+            }, name="TOTAL")
+            cost_breakdown = pd.concat([cost_breakdown, totals.to_frame().T])
+
+            st.dataframe(
+                cost_breakdown.style
+                .format({
+                    "Trade Value ($)":   "${:,.0f}",
+                    "Spread Cost ($)":   "${:.2f}",
+                    "Slippage ($)":      "${:.2f}",
+                    "Total Cost ($)":    "${:.2f}",
+                    "Cost (%)":          "{:.3%}",
+                    "Break-even (days)": "{:.1f}d",
+                })
+                .applymap(highlight_direction, subset=["Direction"]),
+                use_container_width=True,
+            )
+
+            st.caption(
+                "**Why these costs are small for you:** At $25k in large-cap US tech, "
+                "your total rebalancing cost will typically be $5–$30 per full rebalance. "
+                "For context, a 1% intraday move in NVDA on a $5,000 position = $50. "
+                "The signal quality from the BL model matters orders of magnitude more than "
+                "transaction costs at your scale — but timing the entry via the verdict table "
+                "above can save you 0.3–1.0% of slippage on volatile names."
+            )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FOOTER
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+st.caption(
+    "⚠️ **Disclaimer**: Educational and personal research only. Not financial advice. "
+    "All ML signals are trained on historical data and do not predict the future. "
+    "Always pair technical signals with fundamental analysis and risk management. "
+    "Data: Yahoo Finance."
+)
