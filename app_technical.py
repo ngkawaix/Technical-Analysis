@@ -214,40 +214,150 @@ def fit_hmm(returns: pd.Series, n_regimes: int = 3):
     """
     Fit a Gaussian Hidden Markov Model to daily log-returns.
 
+    Pure numpy/scipy implementation — no hmmlearn required.
+    Uses the Baum-Welch algorithm (Expectation-Maximisation for HMMs).
+
     The HMM assumes the market cycles through n_regimes hidden states.
-    At each day, the model uses two observables: return and volatility (|return|).
-    It learns transition probabilities between states and which state best
-    explains the observed return/vol pattern at each point in time.
+    Observables at each day: [return, |return|] — captures both direction
+    and magnitude of daily moves.
+
+    Algorithm
+    ---------
+    E-step: Forward-Backward algorithm computes state occupancy probabilities
+            γ_t(k) = P(state=k at time t | all observations, parameters)
+    M-step: Update means μ_k, covariances Σ_k, and transition matrix A
+            using the weighted sufficient statistics from the E-step.
+    Repeat until log-likelihood converges.
+
+    Decoding: Viterbi algorithm finds the single most likely state sequence.
 
     Parameters
     ----------
     returns   : pd.Series of daily log-returns
-    n_regimes : number of hidden states (default 3: bull / transition / bear)
+    n_regimes : number of hidden states (default 3)
 
     Returns
     -------
-    regimes   : pd.Series of integer state labels, aligned to returns.index
-    model     : fitted GaussianHMM object (for transition matrix inspection)
+    regimes   : pd.Series of integer state labels (0=bull, n-1=bear)
+    model     : dict with transmat_ and other params (mirrors hmmlearn API)
+    remap     : dict mapping original → relabelled state ids
     """
-    from hmmlearn.hmm import GaussianHMM
+    from scipy.stats import multivariate_normal
 
-    r = returns.dropna().values
-    X = np.column_stack([r, np.abs(r)])   # (return, |return|) — captures direction + magnitude
+    rng = np.random.default_rng(42)
+    r   = returns.dropna().values
+    X   = np.column_stack([r, np.abs(r)]).astype(np.float64)  # (T, 2)
+    T, D = X.shape
+    K    = n_regimes
 
-    model = GaussianHMM(
-        n_components=n_regimes,
-        covariance_type="full",
-        n_iter=2000,
-        random_state=42,
-    )
-    model.fit(X)
-    hidden_states = model.predict(X)
+    # ── Initialise parameters with k-means-like seeding ──────────────────────
+    # Sort observations by |return| and assign initial state boundaries
+    sort_idx = np.argsort(X[:, 1])
+    chunk    = T // K
+    mu    = np.array([X[sort_idx[i*chunk:(i+1)*chunk]].mean(axis=0) for i in range(K)])
+    sigma = np.array([np.cov(X[sort_idx[i*chunk:(i+1)*chunk]].T) + np.eye(D)*1e-4
+                      for i in range(K)])
+    pi_0  = np.ones(K) / K                  # initial state distribution
+    A     = np.ones((K, K)) / K             # transition matrix (row = from, col = to)
 
-    # Re-label states so 0 = lowest volatility (bull), n-1 = highest (bear)
-    state_vols = {s: np.abs(r[hidden_states == s]).mean() for s in range(n_regimes)}
+    def log_emission(X, mu, sigma):
+        """Log emission probabilities: (T, K) matrix."""
+        out = np.zeros((T, K))
+        for k in range(K):
+            out[:, k] = multivariate_normal.logpdf(X, mean=mu[k], cov=sigma[k],
+                                                    allow_singular=True)
+        return out
+
+    def forward_backward(log_b):
+        """
+        Baum-Welch forward-backward pass.
+        log_b : (T, K) log emission probabilities
+        Returns gamma (T, K) state occupancies and xi (T-1, K, K) transitions.
+        """
+        # Forward pass: α_t(k) = P(o_1..o_t, s_t=k)
+        log_alpha = np.zeros((T, K))
+        log_alpha[0] = np.log(pi_0 + 1e-300) + log_b[0]
+        for t in range(1, T):
+            for k in range(K):
+                log_alpha[t, k] = log_b[t, k] + np.logaddexp.reduce(
+                    log_alpha[t-1] + np.log(A[:, k] + 1e-300))
+
+        # Backward pass: β_t(k) = P(o_{t+1}..o_T | s_t=k)
+        log_beta = np.zeros((T, K))
+        for t in range(T-2, -1, -1):
+            for k in range(K):
+                log_beta[t, k] = np.logaddexp.reduce(
+                    np.log(A[k] + 1e-300) + log_b[t+1] + log_beta[t+1])
+
+        # Gamma: γ_t(k) = P(s_t=k | all obs)
+        log_gamma = log_alpha + log_beta
+        log_gamma -= np.logaddexp.reduce(log_gamma, axis=1, keepdims=True)
+        gamma = np.exp(log_gamma)
+
+        # Xi: ξ_t(i,j) = P(s_t=i, s_{t+1}=j | all obs)
+        xi = np.zeros((T-1, K, K))
+        for t in range(T-1):
+            for i in range(K):
+                for j in range(K):
+                    xi[t, i, j] = (log_alpha[t, i] + np.log(A[i, j] + 1e-300)
+                                   + log_b[t+1, j] + log_beta[t+1, j])
+            xi[t] = np.exp(xi[t] - np.logaddexp.reduce(xi[t].ravel()))
+
+        ll = np.logaddexp.reduce(log_alpha[-1])
+        return gamma, xi, ll
+
+    # ── Baum-Welch EM loop ────────────────────────────────────────────────────
+    prev_ll = -np.inf
+    for iteration in range(150):
+        log_b          = log_emission(X, mu, sigma)
+        gamma, xi, ll  = forward_backward(log_b)
+
+        # M-step: update parameters
+        gamma_sum = gamma.sum(axis=0) + 1e-300
+        mu_new    = (gamma[:, :, None] * X[:, None, :]).sum(axis=0) / gamma_sum[:, None]
+
+        sigma_new = np.zeros((K, D, D))
+        for k in range(K):
+            diff = X - mu_new[k]
+            sigma_new[k] = ((gamma[:, k, None, None] *
+                             (diff[:, :, None] * diff[:, None, :])).sum(axis=0)
+                            / gamma_sum[k]) + np.eye(D) * 1e-4
+
+        A_new  = xi.sum(axis=0)
+        A_new /= A_new.sum(axis=1, keepdims=True) + 1e-300
+        pi_0   = gamma[0] / gamma[0].sum()
+
+        mu, sigma, A = mu_new, sigma_new, A_new
+
+        if abs(ll - prev_ll) < 1e-4:
+            break
+        prev_ll = ll
+
+    # ── Viterbi decoding ──────────────────────────────────────────────────────
+    log_b     = log_emission(X, mu, sigma)
+    viterbi   = np.zeros((T, K))
+    backptr   = np.zeros((T, K), dtype=int)
+    viterbi[0] = np.log(pi_0 + 1e-300) + log_b[0]
+    for t in range(1, T):
+        trans_prob = viterbi[t-1, :, None] + np.log(A + 1e-300)
+        backptr[t] = trans_prob.argmax(axis=0)
+        viterbi[t] = trans_prob.max(axis=0) + log_b[t]
+    hidden_states = np.zeros(T, dtype=int)
+    hidden_states[-1] = viterbi[-1].argmax()
+    for t in range(T-2, -1, -1):
+        hidden_states[t] = backptr[t+1, hidden_states[t+1]]
+
+    # Re-label: state 0 = lowest volatility (bull), K-1 = highest (bear)
+    state_vols = {s: np.abs(r[hidden_states == s]).mean() for s in range(K)}
     ordered    = sorted(state_vols, key=state_vols.get)
     remap      = {old: new for new, old in enumerate(ordered)}
     relabeled  = np.array([remap[s] for s in hidden_states])
+
+    # Package into a dict that mirrors the hmmlearn API surface we use
+    model = {"transmat_": A[[ordered.index(k) for k in range(K)], :]
+                           [:, [ordered.index(k) for k in range(K)]],
+             "means_":    mu[ordered],
+             "log_likelihood": prev_ll}
 
     regimes = pd.Series(relabeled, index=returns.dropna().index, name="regime")
     return regimes, model, remap
@@ -722,7 +832,7 @@ with tab0:
                           legend=dict(orientation="h", y=1.05),
                           plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                           xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#30363d"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_r:
         st.markdown("#### Classic Signal Summary")
@@ -753,7 +863,7 @@ with tab0:
         legend=dict(orientation="h", y=1.1),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig_ind, use_container_width=True)
+    st.plotly_chart(fig_ind, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — CLASSIC TECHNICALS (deep explainers)
@@ -773,7 +883,7 @@ with tab1:
         rows = []
         for col, (name, formula, meaning) in FEATURE_GLOSSARY.items():
             rows.append({"Feature": col, "Name": name, "Formula": formula, "What it tells you": meaning})
-        st.dataframe(pd.DataFrame(rows).set_index("Feature"), use_container_width=True,
+        st.dataframe(pd.DataFrame(rows).set_index("Feature"), width="stretch",
                      column_config={
                          "Formula": st.column_config.TextColumn("Formula (LaTeX-free)", width="medium"),
                          "What it tells you": st.column_config.TextColumn("What it tells you", width="large"),
@@ -806,7 +916,7 @@ A stock that rose sharply in the last 14 days is likely to mean-revert — RSI f
         fig_rsi.update_layout(height=200, margin=dict(t=10, b=10),
                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                                yaxis=dict(range=[0, 100], gridcolor="#30363d"), showlegend=False)
-        st.plotly_chart(fig_rsi, use_container_width=True)
+        st.plotly_chart(fig_rsi, width="stretch")
 
     with col_b:
         st.markdown("##### MACD — Moving Average Convergence/Divergence")
@@ -838,7 +948,7 @@ Traders watch the **zero-line cross** (MACD goes positive) and the **signal-line
                                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                                 yaxis=dict(gridcolor="#30363d"),
                                 legend=dict(orientation="h", y=1.15, font_size=10))
-        st.plotly_chart(fig_macd, use_container_width=True)
+        st.plotly_chart(fig_macd, width="stretch")
 
     st.divider()
     col_c, col_d = st.columns(2)
@@ -875,7 +985,7 @@ When the bands narrow, a breakout is likely. When price touches a band, mean-rev
                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                               yaxis=dict(gridcolor="#30363d"),
                               legend=dict(orientation="h", y=1.15, font_size=10))
-        st.plotly_chart(fig_bb, use_container_width=True)
+        st.plotly_chart(fig_bb, width="stretch")
 
     with col_d:
         st.markdown("##### SMA Trend Structure")
@@ -903,7 +1013,7 @@ The 200-day SMA is the single most-watched line by institutional investors.
                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                                yaxis=dict(gridcolor="#30363d"),
                                legend=dict(orientation="h", y=1.15, font_size=10))
-        st.plotly_chart(fig_sma, use_container_width=True)
+        st.plotly_chart(fig_sma, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — HMM REGIME DETECTION
@@ -983,7 +1093,7 @@ The HMM reverse-engineers the hidden mode from the observable outputs.
             fig_reg.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
                                           marker=dict(color=reg_col, size=10, symbol="square"),
                                           name=REGIME_LABELS[reg_id]))
-    st.plotly_chart(fig_reg, use_container_width=True)
+    st.plotly_chart(fig_reg, width="stretch")
 
     # Transition matrix heatmap
     col_trans, col_stats = st.columns(2)
@@ -994,7 +1104,7 @@ Each cell [i → j] = **probability of moving from Regime i to Regime j tomorrow
 High diagonal values (e.g. 0.97) = regimes are *persistent*.
 Off-diagonal values show how likely a regime switch is in any given day.
         """)
-        trans_mat = hmm_model.transmat_
+        trans_mat = hmm_model["transmat_"]
         labels    = [REGIME_LABELS[i] for i in range(n_regimes)]
         fig_trans = px.imshow(
             trans_mat,
@@ -1006,7 +1116,7 @@ Off-diagonal values show how likely a regime switch is in any given day.
         fig_trans.update_layout(height=300, margin=dict(t=20, b=10),
                                  paper_bgcolor="rgba(0,0,0,0)",
                                  xaxis_title="To Regime", yaxis_title="From Regime")
-        st.plotly_chart(fig_trans, use_container_width=True)
+        st.plotly_chart(fig_trans, width="stretch")
 
     with col_stats:
         st.markdown("##### Regime Statistics (SPY)")
@@ -1024,7 +1134,7 @@ Off-diagonal values show how likely a regime switch is in any given day.
                 "Ann. vol": f"{r_returns.std() * np.sqrt(252):.1%}",
                 "Sharpe": f"{(r_returns.mean() / r_returns.std() * np.sqrt(252)):.2f}",
             })
-        st.dataframe(pd.DataFrame(stat_rows).set_index("Regime"), use_container_width=True)
+        st.dataframe(pd.DataFrame(stat_rows).set_index("Regime"), width="stretch")
 
         st.markdown("##### Regime History (last 60 days)")
         recent_reg = regimes.tail(60)
@@ -1041,7 +1151,7 @@ Off-diagonal values show how likely a regime switch is in any given day.
                                 xaxis=dict(showgrid=False),
                                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                                 showlegend=False)
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width="stretch")
 
     st.divider()
     # Regime-conditioned stock return distributions
@@ -1063,7 +1173,7 @@ Off-diagonal values show how likely a regime switch is in any given day.
                             xaxis_title="Daily log-return", yaxis_title="Probability",
                             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                             legend=dict(orientation="h", y=1.1))
-    st.plotly_chart(fig_dist, use_container_width=True)
+    st.plotly_chart(fig_dist, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — ML SIGNALS (RF + XGBoost)
@@ -1135,7 +1245,7 @@ predicted up-moves for *this specific stock* over the *training period*.
         fig_prob.update_layout(height=300, margin=dict(t=20, b=10),
                                 yaxis=dict(title="P(Up)", tickformat=".0%", range=[0, 1], gridcolor="#30363d"),
                                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_prob, use_container_width=True)
+        st.plotly_chart(fig_prob, width="stretch")
 
         # Signal accuracy per regime
         if len(regimes) > 0:
@@ -1156,7 +1266,7 @@ predicted up-moves for *this specific stock* over the *training period*.
                     "Signal accuracy": f"{hits.mean():.1%}" if len(hits) > 0 else "N/A",
                 }
             if regime_acc:
-                st.dataframe(pd.DataFrame(regime_acc).T, use_container_width=True)
+                st.dataframe(pd.DataFrame(regime_acc).T, width="stretch")
 
     with col_imp:
         st.markdown("##### Feature Importances — Why does the model signal this?")
@@ -1179,7 +1289,7 @@ Higher = more relied upon. This answers the **"why"** behind the signal.
                                xaxis=dict(title="Avg importance", gridcolor="#30363d"),
                                yaxis=dict(tickfont=dict(size=11)),
                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_imp, use_container_width=True)
+        st.plotly_chart(fig_imp, width="stretch")
 
         # Plain-English explanation for the top 3
         st.markdown("**Top 3 drivers — in plain English:**")
@@ -1194,7 +1304,7 @@ Higher = more relied upon. This answers the **"why"** behind the signal.
         imp_df["Name"]    = imp_df["Feature"].map(lambda f: FEATURE_GLOSSARY.get(f, (f,))[0])
         imp_df["Meaning"] = imp_df["Feature"].map(lambda f: FEATURE_GLOSSARY.get(f, ("","",""))[2])
         st.dataframe(imp_df.set_index("Feature").style.format({"Importance": "{:.4f}"}),
-                     use_container_width=True)
+                     width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 4 — LSTM FORECAST
@@ -1260,7 +1370,7 @@ Normalisation per window (divide by first value) makes the model learn *shape* n
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", y=1.1),
         )
-        st.plotly_chart(fig_lstm, use_container_width=True)
+        st.plotly_chart(fig_lstm, width="stretch")
 
     with col_err:
         st.markdown("##### Prediction Error Distribution")
@@ -1273,7 +1383,7 @@ Normalisation per window (divide by first value) makes the model learn *shape* n
                                xaxis=dict(title="Prediction error (log-return)", tickformat=".1%"),
                                yaxis=dict(title="Count"),
                                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_err, use_container_width=True)
+        st.plotly_chart(fig_err, width="stretch")
 
         st.markdown("##### Performance Summary")
         mae  = float(errors.abs().mean())
@@ -1281,7 +1391,7 @@ Normalisation per window (divide by first value) makes the model learn *shape* n
         st.dataframe(pd.DataFrame({
             "Metric": ["MAE", "RMSE", "Directional Acc", "Correlation"],
             "Value":  [f"{mae:.3%}", f"{rmse:.3%}", f"{directional_acc:.1%}", f"{corr:.3f}"],
-        }).set_index("Metric"), use_container_width=True)
+        }).set_index("Metric"), width="stretch")
 
     st.divider()
 
@@ -1382,7 +1492,7 @@ with tab5:
         .background_gradient(subset=["RSI (14)"], cmap="RdYlGn_r", vmin=20, vmax=80)
         .background_gradient(subset=["BB %B"],    cmap="RdYlGn_r", vmin=0, vmax=1)
     )
-    st.dataframe(styled_scan, use_container_width=True, height=680,
+    st.dataframe(styled_scan, width="stretch", height=680,
                  column_config={
                      "RSI Signal":  st.column_config.TextColumn("RSI Signal", width="small"),
                      "MACD":        st.column_config.TextColumn("MACD ↑/↓", width="small"),
@@ -1410,7 +1520,7 @@ with tab5:
         xaxis=dict(title="RSI (14) — today"),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
     )
-    st.plotly_chart(fig_map, use_container_width=True)
+    st.plotly_chart(fig_map, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — REBALANCING PLANNER
@@ -1635,7 +1745,7 @@ with tab6:
             st.dataframe(
                 curr_df.style
                 .format({"Price": "${:,.2f}", "Market Value": "${:,.2f}", "Current Wt": "{:.2%}"}),
-                use_container_width=True,
+                width="stretch",
             )
 
     # ── SECTION 1: BL Target Weights Input ───────────────────────────────────
@@ -1785,7 +1895,7 @@ with tab6:
                 .background_gradient(subset=["Cost (%)"], cmap="YlOrRd", vmin=0, vmax=0.003)
                 .background_gradient(subset=["Break-even (days)"], cmap="YlOrRd", vmin=0, vmax=3)
             )
-            st.dataframe(styled_trades, use_container_width=True)
+            st.dataframe(styled_trades, width="stretch")
 
             # ── SECTION 3: Entry Timing Verdicts ─────────────────────────────
             st.divider()
@@ -1867,7 +1977,7 @@ with tab6:
                     .map(style_verdict, subset=["Verdict"])
                     .map(highlight_direction, subset=["Direction"])
                 )
-                st.dataframe(styled_verdict, use_container_width=True,
+                st.dataframe(styled_verdict, width="stretch",
                              column_config={
                                  "Reasoning": st.column_config.TextColumn(
                                      "Reasoning", width="large"),
@@ -1901,7 +2011,7 @@ with tab6:
                 margin=dict(t=20, b=20, l=10, r=10),
                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             )
-            st.plotly_chart(fig_wf, use_container_width=True)
+            st.plotly_chart(fig_wf, width="stretch")
 
             # ── SECTION 5: Cost Impact Summary ────────────────────────────────
             st.divider()
@@ -1947,7 +2057,7 @@ with tab6:
                     "Break-even (days)": "{:.1f}d",
                 })
                 .map(highlight_direction, subset=["Direction"]),
-                use_container_width=True,
+                width="stretch",
             )
 
             st.caption(
