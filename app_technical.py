@@ -1680,67 +1680,176 @@ with tab6:
 
         return verdict, colour, reason
 
-    # ── SECTION 0: Holdings Tracker (persistent across sessions) ─────────────
+    # ── PERSISTENCE HELPERS ───────────────────────────────────────────────────
+    # On Streamlit Cloud the app container restarts after inactivity, wiping
+    # session_state. We persist holdings and BL weights to a JSON file in the
+    # app's working directory so they survive cold starts.
+    #
+    # The file lives at ./portfolio_state.json next to the app script.
+    # It is NOT committed to git (.gitignore excludes *.json data files) but
+    # persists on the Streamlit Cloud container between restarts within the
+    # same deployment. For full durability across redeployments, use the
+    # Export / Import buttons below to copy your data out of the browser.
+
+    import json
+
+    _SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_state.json")
+
+    def _load_state() -> dict:
+        """Load holdings + BL weights from disk. Returns defaults if file absent."""
+        try:
+            with open(_SAVE_FILE, "r") as f:
+                data = json.load(f)
+            return {
+                "holdings":   {t: float(data.get("holdings",   {}).get(t, 0.0)) for t in TICKERS},
+                "bl_weights": {t: float(data.get("bl_weights", {}).get(t, 0.0)) for t in TICKERS},
+                "portfolio_size": float(data.get("portfolio_size", 25_000.0)),
+                "saved_at": data.get("saved_at", "never"),
+            }
+        except Exception:
+            return {
+                "holdings":      {t: 0.0 for t in TICKERS},
+                "bl_weights":    {t: 0.0 for t in TICKERS},
+                "portfolio_size": 25_000.0,
+                "saved_at": "never",
+            }
+
+    def _save_state(holdings: dict, bl_weights: dict, portfolio_size: float) -> str:
+        """Write holdings + BL weights to disk. Returns timestamp string."""
+        saved_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        data = {
+            "holdings":      holdings,
+            "bl_weights":    bl_weights,
+            "portfolio_size": portfolio_size,
+            "saved_at":      saved_at,
+        }
+        try:
+            with open(_SAVE_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+            return saved_at
+        except Exception as e:
+            return f"Save failed: {e}"
+
+    # ── Boot: load from disk into session_state (once per session) ────────────
+    if "portfolio_loaded" not in st.session_state:
+        _disk = _load_state()
+        st.session_state.holdings        = _disk["holdings"]
+        st.session_state.bl_weights      = _disk["bl_weights"]
+        st.session_state.portfolio_size  = _disk["portfolio_size"]
+        st.session_state.portfolio_saved_at = _disk["saved_at"]
+        st.session_state.portfolio_loaded = True
+
+    # ── SECTION 0: Holdings Tracker ───────────────────────────────────────────
     st.divider()
     st.markdown("### 1. Current Holdings")
-    st.markdown(
-        "Enter your current positions below. These are saved to session state and "
-        "persist as long as the browser tab is open. **Shares** = what you hold today."
-    )
 
-    # Initialise holdings in session state
-    if "holdings" not in st.session_state:
-        st.session_state.holdings = {t: 0.0 for t in TICKERS}
+    # Save / Load / Export / Import controls
+    ctrl_save, ctrl_info, ctrl_export, ctrl_import = st.columns([1, 2, 1, 2])
+
+    with ctrl_save:
+        if st.button("💾 Save", type="primary", help="Save holdings + BL weights to disk"):
+            # Capture current widget values before saving
+            h_snap  = {t: float(st.session_state.get(f"hold_{t}", 0.0)) for t in TICKERS}
+            bl_snap = {t: float(st.session_state.get(f"bl_{t}",   0.0)) / 100 for t in TICKERS}
+            ps_snap = float(st.session_state.get("portfolio_size_input", st.session_state.portfolio_size))
+            saved_at = _save_state(h_snap, bl_snap, ps_snap)
+            st.session_state.holdings       = h_snap
+            st.session_state.bl_weights     = bl_snap
+            st.session_state.portfolio_size = ps_snap
+            st.session_state.portfolio_saved_at = saved_at
+            st.success(f"Saved at {saved_at}")
+
+    with ctrl_info:
+        st.caption(f"Last saved: **{st.session_state.portfolio_saved_at}**")
+        st.caption("Tip: hit **Save** after any change. Data persists on the server "
+                   "but use **Export** for a permanent local backup.")
+
+    # Export: generate a JSON string the user can copy
+    with ctrl_export:
+        export_data = json.dumps({
+            "holdings":      st.session_state.holdings,
+            "bl_weights":    st.session_state.bl_weights,
+            "portfolio_size": st.session_state.portfolio_size,
+        }, indent=2)
+        st.download_button(
+            "📥 Export JSON",
+            data=export_data,
+            file_name="portfolio_state.json",
+            mime="application/json",
+            help="Download your holdings + BL weights as a JSON file for permanent backup.",
+        )
+
+    # Import: paste JSON to restore
+    with ctrl_import:
+        with st.expander("📤 Import JSON"):
+            pasted = st.text_area("Paste exported JSON here", height=80, key="import_json")
+            if st.button("Load from JSON"):
+                try:
+                    imported = json.loads(pasted)
+                    st.session_state.holdings       = {t: float(imported.get("holdings",   {}).get(t, 0.0)) for t in TICKERS}
+                    st.session_state.bl_weights     = {t: float(imported.get("bl_weights", {}).get(t, 0.0)) for t in TICKERS}
+                    st.session_state.portfolio_size = float(imported.get("portfolio_size", 25_000.0))
+                    _save_state(st.session_state.holdings, st.session_state.bl_weights,
+                                st.session_state.portfolio_size)
+                    st.success("✅ Imported and saved.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Invalid JSON: {e}")
+
+    st.markdown("Enter your current positions. Hit **💾 Save** after editing.")
 
     # Holdings input grid — 4 columns
-    cols_per_row = 4
     tickers_list = TICKERS
-    for row_start in range(0, len(tickers_list), cols_per_row):
-        row_tickers = tickers_list[row_start: row_start + cols_per_row]
-        row_cols    = st.columns(cols_per_row)
+    for row_start in range(0, len(tickers_list), 4):
+        row_tickers = tickers_list[row_start: row_start + 4]
+        row_cols    = st.columns(4)
         for col, t in zip(row_cols, row_tickers):
             with col:
                 price_now = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
-                shares    = col.number_input(
+                col.number_input(
                     f"{t}  (${price_now:,.0f}/sh)",
-                    min_value=0.0, value=float(st.session_state.holdings.get(t, 0.0)),
-                    step=0.1, key=f"hold_{t}",
+                    min_value=0.0,
+                    value=float(st.session_state.holdings.get(t, 0.0)),
+                    step=0.1,
+                    key=f"hold_{t}",
                 )
-                st.session_state.holdings[t] = shares
 
-    # Compute current portfolio value from holdings
+    # Derive live portfolio value from widget state (not session_state.holdings —
+    # that only updates on Save; widgets are always current)
     current_values = {}
     for t in TICKERS:
-        shares    = st.session_state.holdings.get(t, 0.0)
+        shares    = float(st.session_state.get(f"hold_{t}", st.session_state.holdings.get(t, 0.0)))
         price_now = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
         current_values[t] = shares * price_now
 
     total_portfolio_value = sum(current_values.values())
-    cash_outside = max(0.0, 25_000 - total_portfolio_value)  # placeholder
 
-    # Allow user to override total portfolio size
+    # Portfolio size input
     st.divider()
     col_pf1, col_pf2, col_pf3 = st.columns(3)
     portfolio_size = col_pf1.number_input(
         "Total deployable capital (USD)",
-        min_value=1_000.0, value=max(total_portfolio_value, 25_000.0),
+        min_value=1_000.0,
+        value=max(total_portfolio_value, float(st.session_state.portfolio_size)),
         step=500.0,
-        help="Your total capital to allocate — including cash. "
-             "Defaults to $25,000 or the sum of your holdings, whichever is larger.",
+        key="portfolio_size_input",
+        help="Your total capital to allocate including cash. "
+             "Defaults to saved value or the sum of your holdings.",
     )
     col_pf2.metric("Current invested", f"${total_portfolio_value:,.0f}")
-    col_pf3.metric("Estimated cash", f"${max(portfolio_size - total_portfolio_value, 0):,.0f}")
+    col_pf3.metric("Estimated cash",   f"${max(portfolio_size - total_portfolio_value, 0):,.0f}")
 
-    # Show current allocation
+    # Current allocation breakdown
     if total_portfolio_value > 0:
         with st.expander("📊 Current allocation breakdown", expanded=False):
             curr_alloc = {t: v / portfolio_size for t, v in current_values.items() if v > 0}
+            curr_shares = {t: float(st.session_state.get(f"hold_{t}", 0.0)) for t in curr_alloc}
             curr_df = pd.DataFrame({
-                "Ticker":      list(curr_alloc.keys()),
-                "Shares":      [st.session_state.holdings[t] for t in curr_alloc],
-                "Price":       [float(closes[t].iloc[-1]) for t in curr_alloc],
+                "Ticker":       list(curr_alloc.keys()),
+                "Shares":       [curr_shares[t] for t in curr_alloc],
+                "Price":        [float(closes[t].iloc[-1]) for t in curr_alloc],
                 "Market Value": [current_values[t] for t in curr_alloc],
-                "Current Wt":  list(curr_alloc.values()),
+                "Current Wt":   list(curr_alloc.values()),
             }).set_index("Ticker").sort_values("Market Value", ascending=False)
             st.dataframe(
                 curr_df.style
@@ -1753,37 +1862,37 @@ with tab6:
     st.markdown("### 2. BL Target Weights")
     st.markdown(
         "Enter the **BL Optimised** weights from the Portfolio Optimiser app. "
-        "Tickers with zero weight in BL will appear as full sells if you currently hold them."
+        "Hit **💾 Save** above after entering weights — they'll persist across sessions."
     )
     st.caption(
         "💡 Tip: copy the 'BL Optimised' column from the Views, Returns & Weights tab "
         "of the Portfolio Optimiser app directly into these fields."
     )
 
-    if "bl_weights" not in st.session_state:
-        # Sensible placeholder defaults (equal weight across 6 high-conviction names)
-        st.session_state.bl_weights = {t: 0.0 for t in TICKERS}
-
-    bl_cols_per_row = 4
-    for row_start in range(0, len(tickers_list), bl_cols_per_row):
-        row_tickers = tickers_list[row_start: row_start + bl_cols_per_row]
-        row_cols    = st.columns(bl_cols_per_row)
+    for row_start in range(0, len(tickers_list), 4):
+        row_tickers = tickers_list[row_start: row_start + 4]
+        row_cols    = st.columns(4)
         for col, t in zip(row_cols, row_tickers):
             with col:
-                wt = col.number_input(
+                col.number_input(
                     f"{t} BL wt (%)",
                     min_value=0.0, max_value=100.0,
                     value=float(st.session_state.bl_weights.get(t, 0.0)) * 100,
-                    step=0.5, key=f"bl_{t}",
+                    step=0.5,
+                    key=f"bl_{t}",
                 )
-                st.session_state.bl_weights[t] = wt / 100
 
-    bl_total = sum(st.session_state.bl_weights.values())
+    # Read BL weights from widget state
+    bl_live = {t: float(st.session_state.get(f"bl_{t}", 0.0)) / 100 for t in TICKERS}
+    bl_total = sum(bl_live.values())
     if abs(bl_total - 1.0) > 0.02 and bl_total > 0:
         st.warning(f"⚠️ BL weights sum to **{bl_total:.1%}** — should be ~100%. "
                    "Check your inputs from the Portfolio Optimiser.")
     elif bl_total > 0:
         st.success(f"✅ BL weights sum to {bl_total:.1%}")
+
+    # Alias for downstream code that reads st.session_state.bl_weights
+    st.session_state.bl_weights = bl_live
 
     # ── SECTION 2: Trade List + Cost Estimates ────────────────────────────────
     st.divider()
@@ -1816,7 +1925,7 @@ with tab6:
     else:
         trade_rows = []
         for t in TICKERS:
-            target_wt   = st.session_state.bl_weights.get(t, 0.0)
+            target_wt   = bl_live.get(t, 0.0)
             current_wt  = current_values.get(t, 0.0) / portfolio_size
             delta_wt    = target_wt - current_wt
             trade_val   = delta_wt * portfolio_size
