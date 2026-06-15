@@ -365,7 +365,7 @@ def train_lstm(prices: pd.Series, seq_len: int = 30, horizon: int = 5,
     # Feature matrix: close + 5d vol + RSI
     close   = prices.values
     ret_1d  = np.diff(np.log(close), prepend=np.log(close[0]))
-    vol_5d  = pd.Series(ret_1d).rolling(5).std().fillna(method="bfill").values
+    vol_5d  = pd.Series(ret_1d).rolling(5).std().bfill().values
     rsi_raw = pd.Series(close)
     delta   = rsi_raw.diff()
     gain    = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
@@ -1217,7 +1217,7 @@ with tab5:
             "BB %B":       "{:.2f}",
             "52W High Dist": "{:.1%}",
         })
-        .applymap(color_ret, subset=["1D Ret", "1M Ret", "vs SMA 200", "52W High Dist"])
+        .map(color_ret, subset=["1D Ret", "1M Ret", "vs SMA 200", "52W High Dist"])
         .background_gradient(subset=["RSI (14)"], cmap="RdYlGn_r", vmin=20, vmax=80)
         .background_gradient(subset=["BB %B"],    cmap="RdYlGn_r", vmin=0, vmax=1)
     )
@@ -1619,8 +1619,8 @@ with tab6:
                     "Cost (%)":        "{:.3%}",
                     "Break-even (days)": "{:.1f}d",
                 })
-                .applymap(highlight_direction, subset=["Direction"])
-                .applymap(color_delta, subset=["Δ Weight", "Trade Value ($)"])
+                .map(highlight_direction, subset=["Direction"])
+                .map(color_delta, subset=["Δ Weight", "Trade Value ($)"])
                 .background_gradient(subset=["Cost (%)"], cmap="YlOrRd", vmin=0, vmax=0.003)
                 .background_gradient(subset=["Break-even (days)"], cmap="YlOrRd", vmin=0, vmax=3)
             )
@@ -1703,8 +1703,8 @@ with tab6:
 
                 styled_verdict = (
                     verdict_display.style
-                    .applymap(style_verdict, subset=["Verdict"])
-                    .applymap(highlight_direction, subset=["Direction"])
+                    .map(style_verdict, subset=["Verdict"])
+                    .map(highlight_direction, subset=["Direction"])
                 )
                 st.dataframe(styled_verdict, use_container_width=True,
                              column_config={
@@ -1785,7 +1785,7 @@ with tab6:
                     "Cost (%)":          "{:.3%}",
                     "Break-even (days)": "{:.1f}d",
                 })
-                .applymap(highlight_direction, subset=["Direction"]),
+                .map(highlight_direction, subset=["Direction"]),
                 use_container_width=True,
             )
 
