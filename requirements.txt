@@ -1,36 +1,30 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # requirements.txt  —  Technical Analysis (ML) App
 # ─────────────────────────────────────────────────────────────────────────────
-# Target platform : Streamlit Community Cloud (Python 3.11 — see runtime.txt)
+# Target platform : Streamlit Community Cloud (any Python 3.9–3.14)
 # Last validated  : June 2026
 #
-# Root cause of Python 3.14 error: TensorFlow has no wheel for CPython 3.14.
-# Fix: runtime.txt pins Python 3.11, and we use tensorflow-cpu (no CUDA libs,
-# identical Python API, ~200 MB lighter than full tensorflow).
-# tensorflow-cpu supports Python 3.9–3.12 through version 2.18.
+# TensorFlow has been removed entirely. The LSTM is now implemented in
+# pure numpy (BPTT + Adam from scratch). Identical mathematical behaviour,
+# zero framework dependency, works on any Python version Streamlit Cloud uses.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Core web framework ────────────────────────────────────────────────────────
 streamlit>=1.35.0,<2.0.0
 
 # ── Data & numerics ───────────────────────────────────────────────────────────
-numpy>=1.26.0,<2.0.0
-pandas>=2.2.0,<3.0.0
-scipy>=1.12.0,<2.0.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
 
 # ── Market data ───────────────────────────────────────────────────────────────
-yfinance>=0.2.40,<1.0.0
+yfinance>=0.2.40
 requests>=2.31.0
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
-plotly>=5.20.0,<6.0.0
+plotly>=5.20.0
 
 # ── Machine learning ──────────────────────────────────────────────────────────
-scikit-learn>=1.4.0,<2.0.0
-xgboost>=2.0.0,<3.0.0
-hmmlearn>=0.3.0,<1.0.0
-
-# ── Deep learning (LSTM) ─────────────────────────────────────────────────────
-# tensorflow-cpu: no GPU needed on Streamlit Cloud, and avoids the 600 MB
-# CUDA wheel that causes slow cold starts. Python 3.9–3.12 only (hence runtime.txt).
-tensorflow-cpu>=2.16.0,<2.19.0
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+hmmlearn>=0.3.0
