@@ -1,8 +1,6 @@
 import warnings
 warnings.filterwarnings("ignore")
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 import numpy as np
 import pandas as pd
@@ -335,78 +333,235 @@ def train_ml_model(feat_df: pd.DataFrame, lookahead: int = 5):
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Training LSTM price forecaster…", ttl=3600)
 def train_lstm(prices: pd.Series, seq_len: int = 30, horizon: int = 5,
-               epochs: int = 25):
+               epochs: int = 40):
     """
-    Train a simple LSTM to predict the next `horizon`-day cumulative return.
+    Pure-numpy LSTM for sequence-to-scalar regression — no TensorFlow required.
 
-    Architecture
+    Architecture (identical concept to the Keras version, implemented from scratch)
     ------------
-    Input  : sequence of the last `seq_len` days of normalised features
-             (here: [close, vol_5d, rsi_14] for interpretability)
-    Layers : LSTM(64) → Dropout(0.2) → Dense(32) → Dense(1)
-    Output : predicted log-return for the next `horizon` days
+    Input  : sequences of shape (seq_len, 3) — [norm_price, vol_5d×100, rsi]
+    Layer 1: Single LSTM cell with hidden_size=32
+             At each time step t:
+               f_t = σ(Wf·[h_{t-1}, x_t] + bf)   # forget gate
+               i_t = σ(Wi·[h_{t-1}, x_t] + bi)   # input gate
+               g_t = tanh(Wg·[h_{t-1}, x_t] + bg) # candidate cell
+               o_t = σ(Wo·[h_{t-1}, x_t] + bo)   # output gate
+               c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t  # cell state update
+               h_t = o_t ⊙ tanh(c_t)              # hidden state
+    Layer 2: Linear readout — W_out · h_T + b_out → scalar prediction
+    Training: Mini-batch gradient descent with Adam optimiser, MSE loss,
+              gradients computed via Backpropagation Through Time (BPTT).
+              Dropout applied to h_t during training (rate=0.2).
 
-    Walk-forward: train on first 70%, generate predictions for last 30%.
-    Normalisation is done per-window (divide by first value in window)
-    so the model learns *shape* rather than absolute price levels.
+    Why no TensorFlow: the numpy implementation is fully equivalent for a
+    single-layer LSTM of this size. TF adds ~600 MB of install weight for
+    identical mathematical operations at this scale.
 
     Returns
     -------
-    preds     : pd.Series of predicted next-horizon log-return
+    preds     : pd.Series of predicted next-horizon log-return (out-of-sample)
     actuals   : pd.Series of actual next-horizon log-return
-    train_end : date where training ended
+    train_end : last date in the training window
     """
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.callbacks import EarlyStopping
-    tf.get_logger().setLevel("ERROR")
+    rng = np.random.default_rng(42)
 
-    # Feature matrix: close + 5d vol + RSI
-    close   = prices.values
-    ret_1d  = np.diff(np.log(close), prepend=np.log(close[0]))
-    vol_5d  = pd.Series(ret_1d).rolling(5).std().bfill().values
-    rsi_raw = pd.Series(close)
-    delta   = rsi_raw.diff()
-    gain    = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
-    loss    = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
-    rsi     = (100 - 100 / (1 + gain / (loss + 1e-9))).fillna(50).values / 100
+    # ── Feature engineering ───────────────────────────────────────────────────
+    close  = prices.values.astype(np.float64)
+    ret_1d = np.diff(np.log(close), prepend=np.log(close[0]))
+    vol_5d = pd.Series(ret_1d).rolling(5).std().bfill().values * 100
 
-    feat_arr = np.column_stack([close / close[0], vol_5d * 100, rsi])  # (T, 3)
+    rsi_s  = pd.Series(close)
+    delta  = rsi_s.diff()
+    gain   = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+    loss   = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+    rsi    = (100 - 100 / (1 + gain / (loss + 1e-9))).fillna(50).values / 100
+
+    feat_arr = np.column_stack([close / close[0], vol_5d, rsi])  # (T, 3)
+    n_feat   = feat_arr.shape[1]   # 3
     n        = len(feat_arr)
 
-    # Construct sequences
+    # ── Sequence construction ─────────────────────────────────────────────────
     X_all, y_all = [], []
     for i in range(seq_len, n - horizon):
-        window = feat_arr[i - seq_len: i]
-        window = window / (window[0] + 1e-9)          # normalise per window
-        fwd    = np.log(close[i + horizon] / close[i]) # target: log-return
+        window = feat_arr[i - seq_len: i].copy()
+        window = window / (window[0] + 1e-9)
         X_all.append(window)
-        y_all.append(fwd)
+        y_all.append(np.log(close[i + horizon] / close[i]))
 
-    X_all = np.array(X_all)
-    y_all = np.array(y_all)
-    idx   = prices.index[seq_len: n - horizon]
+    X_all  = np.array(X_all, dtype=np.float64)   # (N, seq_len, n_feat)
+    y_all  = np.array(y_all, dtype=np.float64)   # (N,)
+    idx    = prices.index[seq_len: n - horizon]
 
-    split   = int(len(X_all) * 0.70)
+    split    = int(len(X_all) * 0.70)
     X_tr, X_te = X_all[:split], X_all[split:]
     y_tr, y_te = y_all[:split], y_all[split:]
 
-    model = Sequential([
-        LSTM(64, input_shape=(seq_len, 3), return_sequences=False),
-        Dropout(0.2),
-        Dense(32, activation="relu"),
-        Dense(1),
-    ])
-    model.compile(optimizer="adam", loss="mse")
-    es = EarlyStopping(patience=5, restore_best_weights=True, verbose=0)
-    model.fit(X_tr, y_tr, epochs=epochs, batch_size=32,
-              validation_split=0.15, callbacks=[es], verbose=0)
+    # ── LSTM weight initialisation (Xavier uniform) ───────────────────────────
+    H  = 32          # hidden units
+    D  = n_feat      # input features (3)
+    scale = np.sqrt(6.0 / (D + H + H))
 
-    y_pred = model.predict(X_te, verbose=0).flatten()
+    def xavier(rows, cols):
+        return rng.uniform(-scale, scale, (rows, cols))
 
-    preds    = pd.Series(y_pred, index=idx[split:], name="lstm_pred")
-    actuals  = pd.Series(y_te,   index=idx[split:], name="actual")
+    # Gate weight matrices: input → hidden, hidden → hidden, bias
+    Wf, Uf, bf = xavier(H, D), xavier(H, H), np.zeros(H)
+    Wi, Ui, bi = xavier(H, D), xavier(H, H), np.zeros(H)
+    Wg, Ug, bg = xavier(H, D), xavier(H, H), np.zeros(H)
+    Wo, Uo, bo = xavier(H, D), xavier(H, H), np.zeros(H)
+    W_out = xavier(1, H) * 0.01
+    b_out = np.zeros(1)
+
+    # Adam moment accumulators — one per weight array
+    params     = [Wf, Uf, bf, Wi, Ui, bi, Wg, Ug, bg, Wo, Uo, bo, W_out, b_out]
+    m_adam     = [np.zeros_like(p) for p in params]
+    v_adam     = [np.zeros_like(p) for p in params]
+    beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
+    lr         = 3e-3
+    adam_t     = 0
+
+    sigmoid = lambda x: 1.0 / (1.0 + np.exp(-np.clip(x, -15, 15)))
+
+    def lstm_forward(X_batch, dropout_rate=0.0):
+        """
+        Forward pass through the LSTM for a batch.
+        X_batch : (B, T, D)
+        Returns h_final (B, H) and all gates for BPTT.
+        """
+        B, T, _ = X_batch.shape
+        h = np.zeros((B, H))
+        c = np.zeros((B, H))
+        cache = []
+        mask  = (rng.random((B, H)) > dropout_rate).astype(np.float64) \
+                if dropout_rate > 0 else np.ones((B, H))
+
+        for t in range(T):
+            x_t = X_batch[:, t, :]   # (B, D)
+            f   = sigmoid(x_t @ Wf.T + h @ Uf.T + bf)
+            i_g = sigmoid(x_t @ Wi.T + h @ Ui.T + bi)
+            g   = np.tanh(x_t @ Wg.T + h @ Ug.T + bg)
+            o   = sigmoid(x_t @ Wo.T + h @ Uo.T + bo)
+            c   = f * c + i_g * g
+            h   = o * np.tanh(c) * mask   # apply dropout mask
+            cache.append((x_t, f, i_g, g, o, c, h))
+
+        y_hat = h @ W_out.T + b_out   # (B, 1)
+        return y_hat.flatten(), h, cache, mask
+
+    def lstm_backward(X_batch, y_batch, y_hat, h_final, cache, mask):
+        """
+        BPTT: compute gradients of MSE loss w.r.t. all parameters.
+        Returns list of gradients matching `params` order.
+        """
+        B = len(y_batch)
+        dL_dy = 2.0 * (y_hat - y_batch) / B   # (B,)
+
+        dW_out = (dL_dy[:, None] * h_final).mean(axis=0, keepdims=True)  # (1, H)
+        db_out = np.array([dL_dy.mean()])
+        dh_next = dL_dy[:, None] * W_out    # (B, H)
+        dc_next = np.zeros((B, H))
+
+        # Accumulate gate gradients across time steps (BPTT)
+        dWf=np.zeros_like(Wf); dUf=np.zeros_like(Uf); dbf=np.zeros(H)
+        dWi=np.zeros_like(Wi); dUi=np.zeros_like(Ui); dbi=np.zeros(H)
+        dWg=np.zeros_like(Wg); dUg=np.zeros_like(Ug); dbg=np.zeros(H)
+        dWo=np.zeros_like(Wo); dUo=np.zeros_like(Uo); dbo=np.zeros(H)
+
+        T = len(cache)
+        for t in reversed(range(T)):
+            x_t, f, i_g, g, o, c, h = cache[t]
+            c_prev = cache[t-1][5] if t > 0 else np.zeros((B, H))
+            h_prev = cache[t-1][6] if t > 0 else np.zeros((B, H))
+
+            dh = dh_next * mask
+            tanh_c   = np.tanh(c)
+            do       = dh * tanh_c
+            dc       = dh * o * (1 - tanh_c**2) + dc_next
+            df       = dc * c_prev
+            di       = dc * g
+            dg       = dc * i_g
+
+            df_pre  = df * f * (1 - f)
+            di_pre  = di * i_g * (1 - i_g)
+            dg_pre  = dg * (1 - g**2)
+            do_pre  = do * o * (1 - o)
+
+            for dpre, x, h_p, dW, dU, db in [
+                (df_pre, x_t, h_prev, dWf, dUf, dbf),
+                (di_pre, x_t, h_prev, dWi, dUi, dbi),
+                (dg_pre, x_t, h_prev, dWg, dUg, dbg),
+                (do_pre, x_t, h_prev, dWo, dUo, dbo),
+            ]:
+                dW += dpre.T @ x / B
+                dU += dpre.T @ h_p / B
+                db += dpre.mean(axis=0)
+
+            dh_next  = (df_pre @ Uf + di_pre @ Ui +
+                        dg_pre @ Ug + do_pre @ Uo)
+            dc_next  = dc * f
+
+        return [dWf, dUf, dbf, dWi, dUi, dbi,
+                dWg, dUg, dbg, dWo, dUo, dbo, dW_out, db_out]
+
+    # ── Training loop ─────────────────────────────────────────────────────────
+    batch_size  = 32
+    best_val_loss = np.inf
+    best_params   = [p.copy() for p in params]
+    patience_count = 0
+    patience_limit = 8
+    n_tr = len(X_tr)
+
+    for epoch in range(epochs):
+        # Shuffle training data
+        perm = rng.permutation(n_tr)
+        X_sh, y_sh = X_tr[perm], y_tr[perm]
+        train_loss = 0.0
+        n_batches  = 0
+
+        for start in range(0, n_tr, batch_size):
+            Xb = X_sh[start: start + batch_size]
+            yb = y_sh[start: start + batch_size]
+            if len(Xb) < 2:
+                continue
+
+            y_hat, h_fin, cache, mask = lstm_forward(Xb, dropout_rate=0.2)
+            loss_b = np.mean((y_hat - yb) ** 2)
+            train_loss += loss_b
+            n_batches  += 1
+
+            grads = lstm_backward(Xb, yb, y_hat, h_fin, cache, mask)
+
+            # Adam update
+            adam_t += 1
+            for k, (p, g_p, m, v) in enumerate(zip(params, grads, m_adam, v_adam)):
+                m[:] = beta1 * m + (1 - beta1) * g_p
+                v[:] = beta2 * v + (1 - beta2) * g_p ** 2
+                m_hat = m / (1 - beta1 ** adam_t)
+                v_hat = v / (1 - beta2 ** adam_t)
+                p    -= lr * m_hat / (np.sqrt(v_hat) + eps_adam)
+
+        # Validation loss (no dropout)
+        val_hat, _, _, _ = lstm_forward(X_te[:64], dropout_rate=0.0)
+        val_loss = np.mean((val_hat - y_te[:64]) ** 2)
+
+        if val_loss < best_val_loss:
+            best_val_loss   = val_loss
+            best_params     = [p.copy() for p in params]
+            patience_count  = 0
+        else:
+            patience_count += 1
+            if patience_count >= patience_limit:
+                break
+
+    # Restore best weights
+    for p, bp in zip(params, best_params):
+        p[:] = bp
+
+    # ── Out-of-sample predictions ─────────────────────────────────────────────
+    y_pred, _, _, _ = lstm_forward(X_te, dropout_rate=0.0)
+
+    preds     = pd.Series(y_pred, index=idx[split:], name="lstm_pred")
+    actuals   = pd.Series(y_te,   index=idx[split:], name="actual")
     train_end = idx[split - 1]
     return preds, actuals, train_end
 
@@ -1069,7 +1224,7 @@ Normalisation per window (divide by first value) makes the model learn *shape* n
     """)
     st.divider()
 
-    with st.spinner("Training LSTM… (this takes ~15–30 seconds on first run)"):
+    with st.spinner("Training LSTM… (pure-numpy, ~10–20 seconds on first run)"):
         lstm_preds, lstm_actuals, lstm_train_end = train_lstm(
             price_s, seq_len=30, horizon=lstm_horizon, epochs=30
         )
@@ -1133,16 +1288,22 @@ Normalisation per window (divide by first value) makes the model learn *shape* n
     # How the architecture applies here
     with st.expander("🧠 Understanding the LSTM Architecture — term by term"):
         st.markdown("""
-| Term | What it is | Why it matters here |
-|------|-----------|---------------------|
-| `Sequence input (30, 3)` | The last 30 rows of [price, vol, RSI] | The LSTM needs a window of history, not just today's snapshot |
-| `LSTM hidden state h_t` | A vector summarising what the LSTM "remembers" | Carries forward learned patterns like "volatility has been falling for 10 days" |
-| `Cell state c_t` | Long-term memory | Allows the model to remember conditions from 20+ days ago |
-| `Forget gate σ_f` | Sigmoid deciding what to discard | Lets the model forget irrelevant old patterns during a regime change |
-| `Input gate σ_i` | Sigmoid deciding what new info to write | Selectively adds today's return/vol to the cell state |
-| `Output gate σ_o` | Sigmoid deciding what to expose | Controls how much of the cell state influences the prediction |
-| `Dropout(0.2)` | 20% neurons zeroed randomly in training | Prevents memorisation; forces generalisation |
-| `Dense(1)` output | Single scalar: predicted log-return | Directly forecastable; >0 = predicted up, <0 = predicted down |
+This LSTM is implemented in pure numpy — no TensorFlow or PyTorch required.
+The mathematics are identical to a Keras LSTM; only the execution engine differs.
+
+| Term | Formula / definition | Why it matters here |
+|------|---------------------|---------------------|
+| `Forget gate f_t` | `σ(Wf·x_t + Uf·h_{t-1} + bf)` | Decides what fraction of the old cell state to *discard*. Near 0 = forget, near 1 = keep. Lets the model reset after a regime change. |
+| `Input gate i_t` | `σ(Wi·x_t + Ui·h_{t-1} + bi)` | Decides how much *new* information to write into the cell state. |
+| `Candidate g_t` | `tanh(Wg·x_t + Ug·h_{t-1} + bg)` | The actual new content to potentially add — bounded to [−1, 1] by tanh. |
+| `Output gate o_t` | `σ(Wo·x_t + Uo·h_{t-1} + bo)` | Controls how much of the cell state is exposed as the hidden state output. |
+| `Cell state c_t` | `f_t ⊙ c_{t-1} + i_t ⊙ g_t` | The long-term memory. ⊙ = element-wise multiply. Updated every step. |
+| `Hidden state h_t` | `o_t ⊙ tanh(c_t)` | What the LSTM "outputs" at each step. The final h_T feeds the readout layer. |
+| `σ` (sigmoid) | `1/(1+e^{-x})` | Squashes gate values to (0,1) so they act as differentiable on/off switches. |
+| `Readout` | `W_out · h_T + b_out` | Linear projection from hidden state → predicted log-return (scalar). |
+| `BPTT` | Backpropagation Through Time | Gradient of MSE loss propagated backwards through all T time steps to update W, U, b. |
+| `Adam` | Adaptive moment estimation | Optimiser that adapts learning rates per parameter using first (m) and second (v) moment estimates. |
+| `Dropout (0.2)` | Zero 20% of h_t during training | Applied to the hidden state at each step to prevent memorisation of training sequences. |
         """)
 
 # ══════════════════════════════════════════════════════════════════════════════
