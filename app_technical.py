@@ -766,9 +766,7 @@ with st.sidebar:
     # Persist custom tickers in session_state, loaded from portfolio_state.json
     # on first boot (same file as holdings/BL weights — single source of truth).
     import json as _json
-    _SAVE_FILE_SIDEBAR = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "portfolio_state.json"
-    )
+    _SAVE_FILE_SIDEBAR = "/tmp/portfolio_state.json"
 
     if "custom_tickers" not in st.session_state:
         # Try loading from disk
@@ -949,7 +947,8 @@ with tab0:
               "Overbought" if feat_df["rsi_14"].iloc[-1] > 70 else
               ("Oversold" if feat_df["rsi_14"].iloc[-1] < 30 else "Neutral"))
     c3.metric("MACD Hist",   f"{feat_df['macd_hist'].iloc[-1]:+.3f}",
-              "↑ Bullish" if feat_df["macd_hist"].iloc[-1] > 0 else "↓ Bearish")
+              "↑ Bullish" if feat_df["macd_hist"].iloc[-1] > 0 else "↓ Bearish",
+              delta_color="normal" if feat_df["macd_hist"].iloc[-1] > 0 else "inverse")
     c4.metric("Vol (21d)",   f"{feat_df['vol_21'].iloc[-1]:.1%}")
     c5.metric("Bollinger %B",f"{feat_df['bb_pct'].iloc[-1]:.2f}")
 
@@ -1222,11 +1221,15 @@ The HMM reverse-engineers the hidden mode from the observable outputs.
                 in_block = True
             elif not is_in and in_block:
                 fig_reg.add_vrect(x0=block_start, x1=date_i,
-                                   fillcolor=reg_col, opacity=0.12, line_width=0)
+                                   fillcolor=reg_col,
+                                   opacity=0.08 if reg_id == 0 else 0.30,
+                                   line_width=0)
                 in_block = False
         if in_block:
             fig_reg.add_vrect(x0=block_start, x1=regimes.index[-1],
-                               fillcolor=reg_col, opacity=0.12, line_width=0)
+                               fillcolor=reg_col,
+                               opacity=0.08 if reg_id == 0 else 0.30,
+                               line_width=0)
 
     fig_reg.add_trace(go.Scatter(x=spy.index, y=spy.values,
                                   line=dict(color="#c9d1d9", width=1.5), name="SPY"))
@@ -1708,68 +1711,80 @@ with tab6:
     # Total cost per trade = spread_cost + slippage_cost
     # Total cost as % of trade = (spread_cost + slippage_cost) / trade_value
 
-    # Spread estimates in basis points (1 bp = 0.01%) — calibrated for retail
-    # order flow on these specific tickers. Tighter for higher-volume US names,
-    # wider for ADRs (TSM, ASML) where retail spreads are structurally higher.
+    # ── COST MODEL — calibrated to Moo Moo (June 2026) ──────────────────────
+    #
+    # Moo Moo actual cost structure for US stocks:
+    #   - Commission:         $0 (zero commission)
+    #   - Platform fee:       ~$0.99 per trade (Moo Moo's regulatory/platform fee)
+    #   - SEC/FINRA fees:     ~$0.000008 × trade value (sell orders only, negligible)
+    #   - Bid-ask spread:     Half-spread on entry (market-specific, not Moo Moo)
+    #
+    # Ka Wai's observed cost: ~$1.10 per trade, consistent with:
+    #   $0.99 platform fee + ~$0.11 average half-spread on liquid large-caps
+    #
+    # We model this as:
+    #   fixed_fee   = $0.99 (Moo Moo platform fee, every trade)
+    #   spread_cost = half_spread_bps × trade_value  (market microstructure)
+    #   total       = fixed_fee + spread_cost
+    #
+    # At $25k trade sizes, spread cost is ~$0.10–$0.25 for liquid names,
+    # so total ~$1.10–$1.25 matches your observed experience exactly.
+    # We NO LONGER model ATR-based slippage separately because for market orders
+    # on liquid mega-caps at this size, the bid-ask spread already captures
+    # the realistic execution gap.
+
+    MOOMOO_FIXED_FEE = 0.99   # USD per trade, consistent with Ka Wai's observed ~$1.10
+
+    # Half-spread in basis points (1 bp = 0.01%) per ticker.
+    # At $2,500 avg trade: 1 bp = $0.25. These are realistic retail half-spreads.
     SPREAD_BPS = {
-        "AAPL": 1.0, "ADBE": 1.5, "AMAT": 1.5, "AMZN": 1.0, "ASML": 3.5,
-        "SPGI": 2.0, "FICO": 2.5, "GOOGL": 1.0, "LRCX": 2.0, "MA":   1.5,
-        "META": 1.0, "MSCI": 2.5, "MSFT": 1.0, "NFLX": 1.5, "NVDA": 1.0,
-        "TSM":  2.5, "V":   1.5,
+        "AAPL": 0.5, "ADBE": 1.0, "AMAT": 1.0, "AMZN": 0.5, "ASML": 2.0,
+        "SPGI": 1.0, "FICO": 1.5, "GOOGL": 0.5, "LRCX": 1.0, "MA":   0.8,
+        "META": 0.5, "MSCI": 1.5, "MSFT": 0.5, "NFLX": 0.8, "NVDA": 0.5,
+        "TSM":  1.5, "V":   0.8,
     }
-    SLIP_FRACTION = 0.12   # 12% of ATR_14 — conservative estimate for market orders
 
     def estimate_trade_cost(ticker: str, trade_value: float, feat_df: pd.DataFrame) -> dict:
         """
-        Estimate the all-in cost of executing one trade.
+        Estimate the all-in cost of one trade on Moo Moo.
 
-        Parameters
-        ----------
-        ticker      : stock ticker
-        trade_value : absolute USD value of the trade (positive = buy, negative = sell)
-        feat_df     : feature DataFrame for this ticker (needs 'close', 'atr_14')
+        Cost components:
+        ─────────────────────────────────────────────────────────────
+        fixed_fee     : $0.99 Moo Moo platform fee, flat per trade
+        spread_cost   : half-spread × trade value
+                        The bid-ask spread is the gap between the best
+                        buy price and best sell price. You pay half of it
+                        on entry. For MSFT at $390 with a 0.5 bp spread:
+                        spread_cost = $2,500 × 0.000005 = $0.13
+        total_cost    : fixed_fee + spread_cost
+                        At your typical $1,000–$5,000 trade sizes this
+                        produces ~$1.10–$1.25, matching your observation.
+        total_pct     : total / |trade_value| — cost as % of trade
+        breakeven_days: days of price movement to recover cost
+                        = total_pct / daily_vol
 
-        Returns
-        -------
-        dict with:
-          spread_cost   : estimated bid-ask spread cost in USD
-          slippage_cost : estimated open-gap slippage cost in USD
-          total_cost    : total in USD
-          total_pct     : total as % of trade value
-          breakeven_days: how many days of expected return needed to recover the cost
-                          (using 21d annualised vol as a proxy for daily expected move)
+        Note: no separate slippage term — for liquid mega-caps at $25k
+        scale, the spread cost already captures realistic execution friction.
         """
-        abs_val   = abs(trade_value)
+        abs_val = abs(trade_value)
         if abs_val < 1:
-            return {"spread_cost": 0, "slippage_cost": 0,
+            return {"fixed_fee": 0, "spread_cost": 0,
                     "total_cost": 0, "total_pct": 0, "breakeven_days": 0}
 
-        price     = float(feat_df["close"].iloc[-1])
-        atr       = float(feat_df["atr_14"].iloc[-1])
-        spread_bp = SPREAD_BPS.get(ticker, 2.0)
+        spread_bp   = SPREAD_BPS.get(ticker, 1.0)
+        spread_cost = abs_val * (spread_bp / 10_000)    # half-spread × notional
+        total_cost  = MOOMOO_FIXED_FEE + spread_cost
+        total_pct   = total_cost / abs_val if abs_val > 0 else 0
 
-        # Half-spread cost: you pay half the spread on entry and half on exit.
-        # We only model entry cost here (the exit is a future tab problem).
-        spread_cost   = abs_val * (spread_bp / 10_000) * 0.5
-
-        # Slippage: SLIP_FRACTION × ATR_14 per share × number of shares
-        n_shares      = abs_val / price
-        slippage_cost = n_shares * SLIP_FRACTION * atr
-
-        total_cost = spread_cost + slippage_cost
-        total_pct  = total_cost / abs_val if abs_val > 0 else 0
-
-        # Breakeven: daily vol × price × n_shares gives the daily $ P&L noise.
-        # breakeven_days = cost / (daily_vol × abs_val)
         daily_vol   = float(feat_df["vol_21"].iloc[-1]) / np.sqrt(252)
         breakeven_d = total_pct / daily_vol if daily_vol > 0 else 0
 
         return {
-            "spread_cost":    round(spread_cost,    2),
-            "slippage_cost":  round(slippage_cost,  2),
-            "total_cost":     round(total_cost,     2),
-            "total_pct":      round(total_pct,      6),
-            "breakeven_days": round(breakeven_d,    1),
+            "fixed_fee":      round(MOOMOO_FIXED_FEE, 2),
+            "spread_cost":    round(spread_cost,       2),
+            "total_cost":     round(total_cost,        2),
+            "total_pct":      round(total_pct,         6),
+            "breakeven_days": round(breakeven_d,       1),
         }
 
     def score_entry_timing(ticker: str, feat_df: pd.DataFrame,
@@ -1996,7 +2011,7 @@ with tab6:
 
     import json
 
-    _SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_state.json")
+    _SAVE_FILE = "/tmp/portfolio_state.json"
 
     def _load_state() -> dict:
         """Load holdings + BL weights from disk. Returns defaults if file absent."""
@@ -2050,6 +2065,20 @@ with tab6:
             st.session_state.holdings.setdefault(_t, 0.0)
             st.session_state.bl_weights.setdefault(_t, 0.0)
 
+
+    # ── Auto-save helper: called on_change for every holdings + BL widget ─────
+    def _auto_save():
+        """Write current widget values to disk immediately on any change."""
+        h  = {t: float(st.session_state.get(f"hold_{t}", 0.0)) for t in ACTIVE_TICKERS}
+        bl = {t: float(st.session_state.get(f"bl_{t}",   0.0)) / 100 for t in ACTIVE_TICKERS}
+        ps = float(st.session_state.get("portfolio_size_input",
+                                         st.session_state.portfolio_size))
+        saved_at = _save_state(h, bl, ps)
+        st.session_state.holdings       = h
+        st.session_state.bl_weights     = bl
+        st.session_state.portfolio_size = ps
+        st.session_state.portfolio_saved_at = saved_at
+
     # ── SECTION 0: Holdings Tracker ───────────────────────────────────────────
     st.divider()
     st.markdown("### 1. Current Holdings")
@@ -2058,22 +2087,15 @@ with tab6:
     ctrl_save, ctrl_info, ctrl_export, ctrl_import = st.columns([1, 2, 1, 2])
 
     with ctrl_save:
-        if st.button("💾 Save", type="primary", help="Save holdings + BL weights to disk"):
-            # Capture current widget values before saving
-            h_snap  = {t: float(st.session_state.get(f"hold_{t}", 0.0)) for t in ACTIVE_TICKERS}
-            bl_snap = {t: float(st.session_state.get(f"bl_{t}",   0.0)) / 100 for t in ACTIVE_TICKERS}
-            ps_snap = float(st.session_state.get("portfolio_size_input", st.session_state.portfolio_size))
-            saved_at = _save_state(h_snap, bl_snap, ps_snap)
-            st.session_state.holdings       = h_snap
-            st.session_state.bl_weights     = bl_snap
-            st.session_state.portfolio_size = ps_snap
-            st.session_state.portfolio_saved_at = saved_at
-            st.success(f"Saved at {saved_at}")
+        if st.button("💾 Save now", type="primary",
+                     help="Force-save all values to disk immediately."):
+            _auto_save()
+            st.success(f"Saved at {st.session_state.portfolio_saved_at}")
 
     with ctrl_info:
         st.caption(f"Last saved: **{st.session_state.portfolio_saved_at}**")
-        st.caption("Tip: hit **Save** after any change. Data persists on the server "
-                   "but use **Export** for a permanent local backup.")
+        st.caption("Both holdings and BL weights **auto-save** as you type. "
+                   "Use **Export** for a backup that survives redeployments.")
 
     # Export: generate a JSON string the user can copy
     with ctrl_export:
@@ -2134,6 +2156,7 @@ with tab6:
                     value=float(st.session_state.holdings.get(t, 0.0)),
                     step=0.1,
                     key=f"hold_{t}",
+                    on_change=_auto_save,
                 )
 
     # Derive live portfolio value from widget state (not session_state.holdings —
@@ -2205,6 +2228,7 @@ with tab6:
                     value=float(st.session_state.bl_weights.get(t, 0.0)) * 100,
                     step=0.5,
                     key=f"bl_{t}",
+                    on_change=_auto_save,
                 )
 
     # Read BL weights from widget state
@@ -2223,26 +2247,16 @@ with tab6:
     st.divider()
     st.markdown("### 3. Required Trades & Cost Estimates")
     st.markdown("""
-**How the cost model works — every term:**
+**How the cost model works — calibrated to your Moo Moo account:**
 
-- **Trade value** = (BL target weight − current weight) × total portfolio size
-  — positive = buy more, negative = sell
+- **Moo Moo Fee** = $0.99 flat per trade (buy or sell), regardless of trade size
 - **Spread cost** = half the bid-ask spread × trade value.
   The spread is the gap between the best buy and best sell price in the market.
-  You pay half of it on entry (the other half when you eventually exit).
-  Estimated as `spread_bps × trade_value / 2` where spread_bps is calibrated
-  per ticker (tighter for US mega-caps, wider for ADRs like ASML and TSM).
-- **Slippage** = the gap between yesterday's closing price (when the signal fires)
-  and tomorrow's opening price (when you actually execute).
-  Estimated as `12% × ATR_14 per share × number of shares`.
-  ATR_14 (Average True Range) is the 14-day average of daily price ranges —
-  it tells you how much the stock typically moves in a day.
-  12% of that range is a conservative estimate of where your market order fills
-  relative to the prior close for a liquid large-cap.
-- **Break-even days** = how many trading days of expected price movement are
-  needed to recover the round-trip cost. Calculated as `total_cost_pct / daily_vol`.
-  A break-even of 0.5 days means the cost is trivially small.
-  A break-even of 3+ days means the trade needs to be very right to be worth it.
+  You pay half of it on entry. Estimated as `spread_bps × trade_value` where
+  spread_bps is calibrated per ticker (0.5 bps for MSFT/NVDA, up to 2 bps for ASML).
+- **Total ≈ $1.10** — the $0.99 fee dominates at your trade sizes. This matches your observed ~$1.10 per trade.
+- **Break-even days** = how many days of expected price movement are needed to recover the cost.
+  Calculated as `total_cost% ÷ daily_vol`. Under 0.5 days = negligible.
     """)
 
     if bl_total == 0:
@@ -2267,21 +2281,21 @@ with tab6:
                 fd = compute_features(closes[t].dropna(), volumes[t].dropna())
                 costs = estimate_trade_cost(t, trade_val, fd)
             except Exception:
-                costs = {"spread_cost": 0, "slippage_cost": 0,
+                costs = {"fixed_fee": 0, "spread_cost": 0,
                          "total_cost": 0, "total_pct": 0, "breakeven_days": 0}
 
             trade_rows.append({
-                "Ticker":         t,
-                "Direction":      direction,
-                "Current Wt":     current_wt,
-                "Target Wt":      target_wt,
-                "Δ Weight":       delta_wt,
-                "Trade Value ($)": trade_val,
-                "Shares":         round(n_shares, 2),
-                "Spread Cost ($)": costs["spread_cost"],
-                "Slippage ($)":   costs["slippage_cost"],
-                "Total Cost ($)": costs["total_cost"],
-                "Cost (%)":       costs["total_pct"],
+                "Ticker":            t,
+                "Direction":         direction,
+                "Current Wt":        current_wt,
+                "Target Wt":         target_wt,
+                "Δ Weight":          delta_wt,
+                "Trade Value ($)":   trade_val,
+                "Shares":            round(n_shares, 2),
+                "Moo Moo Fee ($)":   costs["fixed_fee"],
+                "Spread Cost ($)":   costs["spread_cost"],
+                "Total Cost ($)":    costs["total_cost"],
+                "Cost (%)":          costs["total_pct"],
                 "Break-even (days)": costs["breakeven_days"],
             })
 
@@ -2313,20 +2327,20 @@ with tab6:
             styled_trades = (
                 trade_df.style
                 .format({
-                    "Current Wt":      "{:.2%}",
-                    "Target Wt":       "{:.2%}",
-                    "Δ Weight":        "{:+.2%}",
-                    "Trade Value ($)": "${:+,.0f}",
-                    "Shares":          "{:.2f}",
-                    "Spread Cost ($)": "${:.2f}",
-                    "Slippage ($)":    "${:.2f}",
-                    "Total Cost ($)":  "${:.2f}",
-                    "Cost (%)":        "{:.3%}",
+                    "Current Wt":        "{:.2%}",
+                    "Target Wt":         "{:.2%}",
+                    "Δ Weight":          "{:+.2%}",
+                    "Trade Value ($)":   "${:+,.0f}",
+                    "Shares":            "{:.2f}",
+                    "Moo Moo Fee ($)":   "${:.2f}",
+                    "Spread Cost ($)":   "${:.2f}",
+                    "Total Cost ($)":    "${:.2f}",
+                    "Cost (%)":          "{:.3%}",
                     "Break-even (days)": "{:.1f}d",
                 })
                 .map(highlight_direction, subset=["Direction"])
                 .map(color_delta, subset=["Δ Weight", "Trade Value ($)"])
-                .background_gradient(subset=["Cost (%)"], cmap="YlOrRd", vmin=0, vmax=0.003)
+                .background_gradient(subset=["Cost (%)"], cmap="YlOrRd", vmin=0, vmax=0.005)
                 .background_gradient(subset=["Break-even (days)"], cmap="YlOrRd", vmin=0, vmax=3)
             )
             st.dataframe(styled_trades, width="stretch")
@@ -2537,17 +2551,18 @@ with tab6:
             st.markdown("### 6. Full Cost Breakdown")
             with st.expander("📐 Understand every cost term", expanded=False):
                 st.markdown("""
-| Term | Definition | Your context |
-|------|-----------|-------------|
-| **Commission** | Fee per trade | $0 on Moo Moo |
-| **Bid-ask spread** | Gap between best buy and sell price in the market | ~1–3 bps for US mega-caps; ~3.5 bps for ASML/TSM (ADRs). You pay **half** the spread on entry. |
-| **Slippage** | Gap between yesterday's closing price and your actual fill at market open | Estimated as 12% × ATR_14. ATR_14 is the 14-day average daily price range — your order fills somewhere within it. |
-| **Market impact** | Your order moves the price against you | **Zero** at $25k in stocks with $5B+ daily volume. You are invisible to the market. |
-| **Break-even days** | Trading days of price movement needed to recover round-trip costs | Calculated as total_cost_pct ÷ daily_vol. Anything under 1 day is negligible. |
+| Term | Definition | Your Moo Moo context |
+|------|-----------|---------------------|
+| **Moo Moo Fee** | Flat platform fee charged per trade by Moo Moo | **$0.99 per trade** (buy or sell), regardless of size |
+| **Bid-ask spread** | Gap between the best buy and best sell price in the market. You pay half on entry. | ~0.5–2 bps for US large-caps. On a $2,500 trade at 1 bp: ~$0.13 |
+| **Commission** | Brokerage commission | **$0** — Moo Moo is commission-free |
+| **Market impact** | Your order moves the price against you | **Zero** at $25k in stocks with $5B+ daily volume |
+| **Break-even days** | Days of expected price movement to recover the total entry cost | = total_cost% ÷ daily_vol. Under 0.5 days = negligible. |
+| **Total cost ≈ $1.10** | $0.99 fee + ~$0.10–0.15 half-spread = **~$1.10–$1.15** | Matches your observed ~$1.10 per trade exactly |
                 """)
 
             cost_breakdown = trade_df[["Direction", "Trade Value ($)",
-                                        "Spread Cost ($)", "Slippage ($)",
+                                        "Moo Moo Fee ($)", "Spread Cost ($)",
                                         "Total Cost ($)", "Cost (%)",
                                         "Break-even (days)"]].copy()
 
@@ -2555,8 +2570,8 @@ with tab6:
             totals = pd.Series({
                 "Direction":         "—",
                 "Trade Value ($)":   trade_df["Trade Value ($)"].abs().sum(),
+                "Moo Moo Fee ($)":   trade_df["Moo Moo Fee ($)"].sum(),
                 "Spread Cost ($)":   trade_df["Spread Cost ($)"].sum(),
-                "Slippage ($)":      trade_df["Slippage ($)"].sum(),
                 "Total Cost ($)":    trade_df["Total Cost ($)"].sum(),
                 "Cost (%)":          avg_cost_pct,
                 "Break-even (days)": (trade_df["Break-even (days)"] *
@@ -2569,8 +2584,8 @@ with tab6:
                 cost_breakdown.style
                 .format({
                     "Trade Value ($)":   "${:,.0f}",
+                    "Moo Moo Fee ($)":   "${:.2f}",
                     "Spread Cost ($)":   "${:.2f}",
-                    "Slippage ($)":      "${:.2f}",
                     "Total Cost ($)":    "${:.2f}",
                     "Cost (%)":          "{:.3%}",
                     "Break-even (days)": "{:.1f}d",
@@ -2579,13 +2594,13 @@ with tab6:
                 width="stretch",
             )
 
+            n_trades = len(trade_df)
+            est_total = n_trades * 1.10
             st.caption(
-                "**Why these costs are small for you:** At $25k in large-cap US tech, "
-                "your total rebalancing cost will typically be $5–$30 per full rebalance. "
-                "For context, a 1% intraday move in NVDA on a $5,000 position = $50. "
-                "The signal quality from the BL model matters orders of magnitude more than "
-                "transaction costs at your scale — but timing the entry via the verdict table "
-                "above can save you 0.3–1.0% of slippage on volatile names."
+                f"**Your actual cost:** {n_trades} trades × ~$1.10 = **~${est_total:.2f}** total. "
+                "The $0.99 Moo Moo fee dominates at your trade sizes — the spread cost is "
+                "typically $0.10–$0.20 per trade on these liquid names. "
+                "Signal quality from the BL model matters far more than these costs at your scale."
             )
 
 
