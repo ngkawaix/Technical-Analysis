@@ -90,6 +90,44 @@ def load_prices(tickers, start="2018-01-01"):
     return closes, raw["Volume"].ffill().dropna(how="all")
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def validate_and_load_ticker(ticker: str, start: str) -> tuple[bool, str]:
+    """
+    Validate a user-supplied ticker and return (is_valid, message).
+    Checks: exists on Yahoo Finance, has ≥ 2 years of data from `start`,
+    and < 10% missing values. Cached 1 hour so repeated attempts don't
+    re-hit the API.
+    """
+    import time
+    try:
+        t = yf.Ticker(ticker)
+        price = t.fast_info.last_price
+        if price is None or price <= 0:
+            return False, f"**{ticker}** not found on Yahoo Finance."
+    except Exception:
+        return False, f"Could not retrieve data for **{ticker}**. Check the symbol."
+
+    try:
+        raw = yf.download(ticker, start=start, auto_adjust=True, progress=False)
+        if raw.empty:
+            return False, f"**{ticker}** has no price data from {start}."
+        prices = raw["Close"].squeeze().dropna()
+        n_days = len(prices)
+        min_days = 504   # ~2 years — enough for ML training window
+        if n_days < min_days:
+            return False, (
+                f"**{ticker}** only has {n_days} trading days from {start} "
+                f"(minimum {min_days} ≈ 2 years). Move the data start date earlier "
+                "or choose a stock with more history."
+            )
+        missing = raw["Close"].squeeze().isna().mean()
+        if missing > 0.10:
+            return False, f"**{ticker}** has {missing:.0%} missing data — too patchy to use."
+    except Exception as e:
+        return False, f"Download failed for **{ticker}**: {e}"
+
+    return True, f"✅ **{ticker}** added ({n_days} trading days from {start})."
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_spy(start="2018-01-01"):
     raw = yf.download("SPY", start=start, auto_adjust=True, progress=False)
     s = raw["Close"].squeeze()
@@ -724,7 +762,104 @@ with st.sidebar:
     st.caption("Technical Analysis — ML Edition")
     st.divider()
 
-    selected_ticker = st.selectbox("Stock", TICKERS, index=TICKERS.index("NVDA"))
+    # ── Custom ticker universe management ─────────────────────────────────────
+    # Persist custom tickers in session_state, loaded from portfolio_state.json
+    # on first boot (same file as holdings/BL weights — single source of truth).
+    import json as _json
+    _SAVE_FILE_SIDEBAR = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "portfolio_state.json"
+    )
+
+    if "custom_tickers" not in st.session_state:
+        # Try loading from disk
+        try:
+            with open(_SAVE_FILE_SIDEBAR) as _f:
+                _saved = _json.load(_f)
+            st.session_state.custom_tickers = [
+                t.upper() for t in _saved.get("custom_tickers", [])
+                if t.upper() not in TICKERS
+            ]
+        except Exception:
+            st.session_state.custom_tickers = []
+
+    if "ticker_msg" not in st.session_state:
+        st.session_state.ticker_msg = None   # (kind, text) or None
+
+    st.subheader("📌 Universe")
+    st.caption(f"Core: {len(TICKERS)} stocks  |  Custom: {len(st.session_state.custom_tickers)}")
+
+    # Add ticker row
+    _inp_col, _btn_col = st.columns([3, 1])
+    with _inp_col:
+        _new_raw = st.text_input(
+            "Add ticker", placeholder="e.g. BABA",
+            label_visibility="collapsed", key="new_ticker_input",
+            help=(
+                "Any valid Yahoo Finance ticker. Must have ≥ 2 years of data "
+                "from your chosen start date. Saved automatically on Add."
+            ),
+        )
+    with _btn_col:
+        _add_clicked = st.button("Add", use_container_width=True, key="add_ticker_btn")
+
+    if _add_clicked and _new_raw.strip():
+        _t = _new_raw.strip().upper()
+        if _t in TICKERS:
+            st.session_state.ticker_msg = ("info", f"**{_t}** is already in the core universe.")
+        elif _t in st.session_state.custom_tickers:
+            st.session_state.ticker_msg = ("info", f"**{_t}** is already added.")
+        else:
+            with st.spinner(f"Validating {_t}…"):
+                # Use the sidebar's data_start — defined below; default to 2018 if not yet set
+                _start_for_val = st.session_state.get("sidebar_data_start", "2018-01-01")
+                _valid, _msg = validate_and_load_ticker(_t, _start_for_val)
+            if _valid:
+                st.session_state.custom_tickers.append(_t)
+                st.session_state.ticker_msg = ("success", _msg)
+                # Persist to disk immediately
+                try:
+                    with open(_SAVE_FILE_SIDEBAR) as _f:
+                        _state = _json.load(_f)
+                except Exception:
+                    _state = {}
+                _state["custom_tickers"] = st.session_state.custom_tickers
+                with open(_SAVE_FILE_SIDEBAR, "w") as _f:
+                    _json.dump(_state, _f, indent=2)
+                st.rerun()
+            else:
+                st.session_state.ticker_msg = ("error", _msg)
+
+    # Show last add message
+    if st.session_state.ticker_msg:
+        _kind, _text = st.session_state.ticker_msg
+        if _kind == "success": st.success(_text)
+        elif _kind == "error":  st.error(_text)
+        elif _kind == "info":   st.info(_text)
+
+    # List custom tickers with remove buttons
+    if st.session_state.custom_tickers:
+        for _ct in list(st.session_state.custom_tickers):
+            _nc, _rc = st.columns([5, 1])
+            with _nc:
+                st.markdown(f"`{_ct}` ✦")
+            with _rc:
+                if st.button("✕", key=f"rm_{_ct}", help=f"Remove {_ct}"):
+                    st.session_state.custom_tickers.remove(_ct)
+                    st.session_state.ticker_msg = None
+                    # Persist removal
+                    try:
+                        with open(_SAVE_FILE_SIDEBAR) as _f:
+                            _state = _json.load(_f)
+                    except Exception:
+                        _state = {}
+                    _state["custom_tickers"] = st.session_state.custom_tickers
+                    with open(_SAVE_FILE_SIDEBAR, "w") as _f:
+                        _json.dump(_state, _f, indent=2)
+                    st.rerun()
+
+    st.divider()
+
+    # ── Other settings ────────────────────────────────────────────────────────
     n_regimes = st.radio("HMM Regime Count", [2, 3], index=1, horizontal=True)
     lookahead = st.slider("ML signal lookahead (days)", 1, 21, 5, 1,
                           help="How many days ahead the RF/XGB model targets. "
@@ -734,6 +869,8 @@ with st.sidebar:
     data_start = st.date_input("Data start", value=date(2018, 1, 1),
                                min_value=date(2015, 1, 1),
                                max_value=(datetime.today() - timedelta(days=365*2)).date())
+    # Store for use in validation
+    st.session_state.sidebar_data_start = data_start.strftime("%Y-%m-%d")
     st.divider()
     st.caption("💡 **How the app fits together:**\n\n"
                "- **Overview**: daily dashboard of all signals in one glance\n"
@@ -741,15 +878,26 @@ with st.sidebar:
                "- **Regime**: HMM detects market states from hidden volatility patterns\n"
                "- **ML Signals**: RF+XGBoost predict short-term direction\n"
                "- **LSTM Forecast**: deep learning on price sequences\n"
-               "- **Universe**: all 17 stocks at once")
+               "- **Universe**: all stocks including custom additions\n"
+               "- **Rebalancing**: trade planner with timing verdicts")
+
+# ── Active universe: core + custom, deduplicated and sorted ──────────────────
+ACTIVE_TICKERS = sorted(set(TICKERS + st.session_state.get("custom_tickers", [])))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA LOAD
 # ─────────────────────────────────────────────────────────────────────────────
 start_str = data_start.strftime("%Y-%m-%d")
 with st.spinner("Loading price & volume data for the full universe…"):
-    closes, volumes = load_prices(TICKERS, start=start_str)
+    closes, volumes = load_prices(tuple(ACTIVE_TICKERS), start=start_str)
     spy = load_spy(start=start_str)
+
+# Selected ticker for single-stock tabs — placed here so ACTIVE_TICKERS is available
+_default_idx = ACTIVE_TICKERS.index("NVDA") if "NVDA" in ACTIVE_TICKERS else 0
+selected_ticker = st.sidebar.selectbox(
+    "Analyse stock", ACTIVE_TICKERS, index=_default_idx,
+    help="Drives Overview, Technicals, ML Signals, and LSTM tabs.",
+)
 
 # Filter to selected ticker
 price_s  = closes[selected_ticker].dropna()
@@ -769,7 +917,7 @@ last_date   = price_s.index[-1].strftime("%d %b %Y")
 st.title("🔬 Technical Analysis — ML Edition")
 st.caption(
     f"Daily analysis as of **{last_date}**  |  "
-    f"Universe: **{len(TICKERS)} stocks**  |  "
+    f"Universe: **{len(ACTIVE_TICKERS)} stocks** ({len(TICKERS)} core + {len(ACTIVE_TICKERS)-len(TICKERS)} custom)  |  "
     f"Data from: **{start_str}**  |  "
     f"Companion to the **Portfolio Optimiser (DCF-BL)** app"
 )
@@ -777,7 +925,7 @@ st.caption(
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Overview",
     "📈 Technicals",
     "🔄 Regime Detection",
@@ -785,6 +933,7 @@ tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🧠 LSTM Forecast",
     "🌐 Universe Scanner",
     "💼 Rebalancing Planner",
+    "🔍 Signal Audit",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1428,9 +1577,9 @@ with tab5:
     )
     st.divider()
 
-    with st.spinner("Computing signals for all 17 tickers…"):
+    with st.spinner(f"Computing signals for all {len(ACTIVE_TICKERS)} tickers…"):
         scanner_rows = []
-        for t in TICKERS:
+        for t in ACTIVE_TICKERS:
             if t not in closes.columns or t not in volumes.columns:
                 continue
             try:
@@ -1455,6 +1604,7 @@ with tab5:
 
                 scanner_rows.append({
                     "Ticker":         t,
+                    "Type":           "✦ Rotation" if t in st.session_state.get("custom_tickers", []) else "Core",
                     "Last Price":     float(p.iloc[-1]),
                     "1D Ret":         daily_r,
                     "1M Ret":         float(last_fd["ret_21d"]),
@@ -1494,6 +1644,7 @@ with tab5:
     )
     st.dataframe(styled_scan, width="stretch", height=680,
                  column_config={
+                     "Type":        st.column_config.TextColumn("Type", width="small"),
                      "RSI Signal":  st.column_config.TextColumn("RSI Signal", width="small"),
                      "MACD":        st.column_config.TextColumn("MACD ↑/↓", width="small"),
                      "Vol Regime":  st.column_config.TextColumn("Vol", width="small"),
@@ -1502,12 +1653,14 @@ with tab5:
 
     st.divider()
     st.markdown("##### 1-Month Return  vs.  RSI — Momentum Map")
-    st.caption("Each bubble = one stock. X-axis = RSI (potential overbought/oversold), "
-               "Y-axis = 1-month return. Top-left = strong returns but not yet overbought.")
+    st.caption("Each bubble = one stock. X-axis = RSI, Y-axis = 1-month return. "
+               "✦ = rotation candidate. Top-left = strong returns, not yet overbought.")
     fig_map = px.scatter(
         scan_df.reset_index(), x="RSI (14)", y="1M Ret", text="Ticker",
-        color="Vol Regime",
-        color_discrete_map={"High": "#D85A30", "Normal": "#1D9E75"},
+        color="Type",
+        color_discrete_map={"Core": "#1D9E75", "✦ Rotation": "#F5A623"},
+        symbol="Type",
+        symbol_map={"Core": "circle", "✦ Rotation": "diamond"},
         size_max=14,
     )
     fig_map.add_vline(x=70, line_dash="dot", line_color="#D85A30", opacity=0.5)
@@ -1519,6 +1672,7 @@ with tab5:
         yaxis=dict(tickformat=".0%", title="1-Month Return", gridcolor="#30363d"),
         xaxis=dict(title="RSI (14) — today"),
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(title="", orientation="h", y=1.08),
     )
     st.plotly_chart(fig_map, width="stretch")
 
@@ -1620,65 +1774,214 @@ with tab6:
 
     def score_entry_timing(ticker: str, feat_df: pd.DataFrame,
                            regime: int, prob_up: float | None,
-                           direction: str) -> tuple[str, str, str]:
+                           direction: str) -> dict:
         """
-        Synthesise regime + ML signal + technicals into a timing verdict.
+        Synthesise regime + ML signal + technicals into a structured scorecard.
 
-        Parameters
-        ----------
-        direction : "BUY" or "SELL"
-
-        Returns (verdict, colour, reasoning)
-        -------
-        verdict   : "Execute now" / "Wait for better entry" / "Proceed with caution"
-        colour    : hex colour for the badge
-        reasoning : one-sentence plain-English explanation
+        Returns a dict with:
+          verdict        : str  — "✅ Execute now" / "⚠️ Proceed with caution" / "🔴 Wait"
+          colour         : str  — hex colour
+          score          : float — normalised [-1, +1]
+          confidence_pct : int  — how many signals agree (0-100%)
+          signals        : list of dicts {name, vote(+1/0/-1), value, reason}
+          top_reasons    : list of 2 plain-English strings (strongest for + against)
+          regime_label   : str
         """
         last = feat_df.iloc[-1]
-        rsi  = float(last["rsi_14"])
-        macd = float(last["macd_hist"])
+        rsi   = float(last["rsi_14"])
+        macd  = float(last["macd_hist"])
         vs200 = float(last["price_vs_sma200"])
-        bb   = float(last["bb_pct"])
+        bb    = float(last["bb_pct"])
+        vol_r = float(last["vol_ratio"])
+        ret5  = float(last["ret_5d"])
         regime_label = REGIME_LABELS.get(regime, "Unknown")
 
-        signals = []   # positive = favours the trade direction
+        # ── Signal definitions ────────────────────────────────────────────────
+        # Each entry: (name, vote, value_str, favour_reason, oppose_reason)
+        # vote: +1 = favours trade, -1 = opposes, 0 = neutral
 
+        raw_signals = []
+
+        # 1. Market Regime (HMM)
         if direction == "BUY":
-            signals.append(+1 if regime == 0 else (-1 if regime == 2 else 0))  # bull regime
-            signals.append(+1 if rsi < 55 else (-1 if rsi > 70 else 0))        # not overbought
-            signals.append(+1 if macd > 0 else -1)                              # momentum
-            signals.append(+1 if vs200 > 0 else -1)                             # above 200-SMA
-            signals.append(+1 if bb < 0.8 else -1)                              # not at upper band
-            if prob_up is not None:
-                signals.append(+1 if prob_up > 0.55 else (-1 if prob_up < 0.45 else 0))
-        else:  # SELL
-            signals.append(-1 if regime == 0 else (+1 if regime == 2 else 0))
-            signals.append(+1 if rsi > 60 else (-1 if rsi < 35 else 0))
-            signals.append(+1 if macd < 0 else -1)
-            signals.append(+1 if vs200 < 0 else -1)
-            signals.append(+1 if bb > 0.6 else -1)
-            if prob_up is not None:
-                signals.append(+1 if prob_up < 0.45 else (-1 if prob_up > 0.55 else 0))
+            rv = +1 if regime == 0 else (-1 if regime == 2 else 0)
+            raw_signals.append({
+                "name":  "Market Regime",
+                "vote":  rv,
+                "value": regime_label,
+                "reason_for":    f"Bull regime ({regime_label}) historically favours entries.",
+                "reason_against": f"Regime is {regime_label} — elevated risk for new longs.",
+            })
+        else:
+            rv = +1 if regime == 2 else (-1 if regime == 0 else 0)
+            raw_signals.append({
+                "name":  "Market Regime",
+                "vote":  rv,
+                "value": regime_label,
+                "reason_for":    f"Bear regime ({regime_label}) supports reducing exposure.",
+                "reason_against": f"Bull regime ({regime_label}) — selling into strength.",
+            })
 
-        score = sum(signals) / len(signals)   # normalised: +1 = all signals agree, -1 = all oppose
+        # 2. RSI — momentum / mean reversion
+        if direction == "BUY":
+            rv = +1 if rsi < 55 else (-1 if rsi > 70 else 0)
+            raw_signals.append({
+                "name":  "RSI (14)",
+                "vote":  rv,
+                "value": f"{rsi:.1f}",
+                "reason_for":    f"RSI {rsi:.1f} — not overbought, room to run.",
+                "reason_against": f"RSI {rsi:.1f} — overbought territory, mean-reversion risk.",
+            })
+        else:
+            rv = +1 if rsi > 60 else (-1 if rsi < 35 else 0)
+            raw_signals.append({
+                "name":  "RSI (14)",
+                "vote":  rv,
+                "value": f"{rsi:.1f}",
+                "reason_for":    f"RSI {rsi:.1f} — elevated, favours trimming.",
+                "reason_against": f"RSI {rsi:.1f} — oversold, selling into weakness.",
+            })
 
-        if score >= 0.4:
+        # 3. MACD Histogram — momentum direction
+        if direction == "BUY":
+            rv = +1 if macd > 0 else -1
+            raw_signals.append({
+                "name":  "MACD",
+                "vote":  rv,
+                "value": f"{macd:+.3f}",
+                "reason_for":    f"MACD histogram positive ({macd:+.3f}) — upward momentum.",
+                "reason_against": f"MACD histogram negative ({macd:+.3f}) — momentum is falling.",
+            })
+        else:
+            rv = +1 if macd < 0 else -1
+            raw_signals.append({
+                "name":  "MACD",
+                "vote":  rv,
+                "value": f"{macd:+.3f}",
+                "reason_for":    f"MACD negative ({macd:+.3f}) — downward momentum supports sell.",
+                "reason_against": f"MACD positive ({macd:+.3f}) — selling into rising momentum.",
+            })
+
+        # 4. SMA 200 — structural trend
+        if direction == "BUY":
+            rv = +1 if vs200 > 0 else -1
+            raw_signals.append({
+                "name":  "vs SMA 200",
+                "vote":  rv,
+                "value": f"{vs200:+.1%}",
+                "reason_for":    f"Price {vs200:+.1%} above SMA200 — long-term uptrend intact.",
+                "reason_against": f"Price {vs200:+.1%} below SMA200 — buying against the trend.",
+            })
+        else:
+            rv = +1 if vs200 < 0 else -1
+            raw_signals.append({
+                "name":  "vs SMA 200",
+                "vote":  rv,
+                "value": f"{vs200:+.1%}",
+                "reason_for":    f"Price {vs200:+.1%} below SMA200 — structural downtrend, trim.",
+                "reason_against": f"Price {vs200:+.1%} above SMA200 — selling long-term strength.",
+            })
+
+        # 5. Bollinger %B — price extremes
+        if direction == "BUY":
+            rv = +1 if bb < 0.75 else -1
+            raw_signals.append({
+                "name":  "Bollinger %B",
+                "vote":  rv,
+                "value": f"{bb:.2f}",
+                "reason_for":    f"%B = {bb:.2f} — price not at upper band, room to buy.",
+                "reason_against": f"%B = {bb:.2f} — price near upper Bollinger Band, stretched.",
+            })
+        else:
+            rv = +1 if bb > 0.6 else -1
+            raw_signals.append({
+                "name":  "Bollinger %B",
+                "vote":  rv,
+                "value": f"{bb:.2f}",
+                "reason_for":    f"%B = {bb:.2f} — price elevated in band, good trim level.",
+                "reason_against": f"%B = {bb:.2f} — price near lower band, oversold.",
+            })
+
+        # 6. Volatility Regime — risk context
+        if direction == "BUY":
+            rv = +1 if vol_r < 1.1 else (-1 if vol_r > 1.5 else 0)
+            raw_signals.append({
+                "name":  "Vol Regime",
+                "vote":  rv,
+                "value": f"{vol_r:.2f}×",
+                "reason_for":    f"Vol ratio {vol_r:.2f} — short-term vol normal, stable entry.",
+                "reason_against": f"Vol ratio {vol_r:.2f} — short-term vol elevated, timing risk.",
+            })
+        else:
+            rv = +1 if vol_r > 1.2 else 0
+            raw_signals.append({
+                "name":  "Vol Regime",
+                "vote":  rv,
+                "value": f"{vol_r:.2f}×",
+                "reason_for":    f"Vol ratio {vol_r:.2f} — elevated vol supports reducing risk.",
+                "reason_against": f"Vol ratio {vol_r:.2f} — vol normal, no urgency to sell.",
+            })
+
+        # 7. ML Model P(Up) — data-driven signal
+        if prob_up is not None:
+            if direction == "BUY":
+                rv = +1 if prob_up > 0.55 else (-1 if prob_up < 0.45 else 0)
+                raw_signals.append({
+                    "name":  "ML Signal",
+                    "vote":  rv,
+                    "value": f"{prob_up:.1%}",
+                    "reason_for":    f"ML model estimates {prob_up:.1%} probability of up move.",
+                    "reason_against": f"ML model only estimates {prob_up:.1%} chance of up — weak conviction.",
+                })
+            else:
+                rv = +1 if prob_up < 0.45 else (-1 if prob_up > 0.55 else 0)
+                raw_signals.append({
+                    "name":  "ML Signal",
+                    "vote":  rv,
+                    "value": f"{prob_up:.1%}",
+                    "reason_for":    f"ML model estimates {prob_up:.1%} probability of up — supports sell.",
+                    "reason_against": f"ML model estimates {prob_up:.1%} probability of up — model says hold.",
+                })
+
+        # ── Aggregate ─────────────────────────────────────────────────────────
+        votes  = [s["vote"] for s in raw_signals]
+        n      = len(votes)
+        score  = sum(votes) / n
+
+        # Confidence = % of signals that are non-neutral AND agree with direction
+        agree  = sum(1 for v in votes if v == +1)
+        oppose = sum(1 for v in votes if v == -1)
+        confidence_pct = int(100 * agree / n)
+
+        # Top reasons: strongest for + strongest against
+        for_reasons     = [s["reason_for"]     for s in raw_signals if s["vote"] == +1]
+        against_reasons = [s["reason_against"] for s in raw_signals if s["vote"] == -1]
+        top_reasons = []
+        if for_reasons:     top_reasons.append(("for",     for_reasons[0]))
+        if against_reasons: top_reasons.append(("against", against_reasons[0]))
+
+        if score >= 0.35:
             verdict = "✅ Execute now"
             colour  = "#1D9E75"
-            reason  = (f"Signals broadly favour a {direction.lower()} "
-                       f"in the current {regime_label} regime.")
         elif score >= 0.0:
             verdict = "⚠️ Proceed with caution"
             colour  = "#F5A623"
-            reason  = (f"Mixed signals — regime is {regime_label}, "
-                       f"but some technical indicators are working against a {direction.lower()}.")
         else:
             verdict = "🔴 Wait for better entry"
             colour  = "#D85A30"
-            reason  = (f"Most signals oppose a {direction.lower()} here. "
-                       f"Regime: {regime_label}. Consider waiting for a pullback or confirmation.")
 
-        return verdict, colour, reason
+        return {
+            "verdict":         verdict,
+            "colour":          colour,
+            "score":           score,
+            "confidence_pct":  confidence_pct,
+            "agree":           agree,
+            "oppose":          oppose,
+            "n_signals":       n,
+            "signals":         raw_signals,
+            "top_reasons":     top_reasons,
+            "regime_label":    regime_label,
+        }
 
     # ── PERSISTENCE HELPERS ───────────────────────────────────────────────────
     # On Streamlit Cloud the app container restarts after inactivity, wiping
@@ -1701,27 +2004,28 @@ with tab6:
             with open(_SAVE_FILE, "r") as f:
                 data = json.load(f)
             return {
-                "holdings":   {t: float(data.get("holdings",   {}).get(t, 0.0)) for t in TICKERS},
-                "bl_weights": {t: float(data.get("bl_weights", {}).get(t, 0.0)) for t in TICKERS},
+                "holdings":   {t: float(data.get("holdings",   {}).get(t, 0.0)) for t in ACTIVE_TICKERS},
+                "bl_weights": {t: float(data.get("bl_weights", {}).get(t, 0.0)) for t in ACTIVE_TICKERS},
                 "portfolio_size": float(data.get("portfolio_size", 25_000.0)),
                 "saved_at": data.get("saved_at", "never"),
             }
         except Exception:
             return {
-                "holdings":      {t: 0.0 for t in TICKERS},
-                "bl_weights":    {t: 0.0 for t in TICKERS},
+                "holdings":      {t: 0.0 for t in ACTIVE_TICKERS},
+                "bl_weights":    {t: 0.0 for t in ACTIVE_TICKERS},
                 "portfolio_size": 25_000.0,
                 "saved_at": "never",
             }
 
     def _save_state(holdings: dict, bl_weights: dict, portfolio_size: float) -> str:
-        """Write holdings + BL weights to disk. Returns timestamp string."""
+        """Write holdings + BL weights + custom tickers to disk."""
         saved_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         data = {
-            "holdings":      holdings,
-            "bl_weights":    bl_weights,
+            "holdings":       holdings,
+            "bl_weights":     bl_weights,
             "portfolio_size": portfolio_size,
-            "saved_at":      saved_at,
+            "custom_tickers": st.session_state.get("custom_tickers", []),
+            "saved_at":       saved_at,
         }
         try:
             with open(_SAVE_FILE, "w") as f:
@@ -1738,6 +2042,13 @@ with tab6:
         st.session_state.portfolio_size  = _disk["portfolio_size"]
         st.session_state.portfolio_saved_at = _disk["saved_at"]
         st.session_state.portfolio_loaded = True
+    else:
+        # On subsequent reruns (e.g. after adding a custom ticker), ensure
+        # any newly-added tickers exist in session state dicts with 0.0 default
+        # so the holdings/BL grids render correctly without a full reload.
+        for _t in ACTIVE_TICKERS:
+            st.session_state.holdings.setdefault(_t, 0.0)
+            st.session_state.bl_weights.setdefault(_t, 0.0)
 
     # ── SECTION 0: Holdings Tracker ───────────────────────────────────────────
     st.divider()
@@ -1749,8 +2060,8 @@ with tab6:
     with ctrl_save:
         if st.button("💾 Save", type="primary", help="Save holdings + BL weights to disk"):
             # Capture current widget values before saving
-            h_snap  = {t: float(st.session_state.get(f"hold_{t}", 0.0)) for t in TICKERS}
-            bl_snap = {t: float(st.session_state.get(f"bl_{t}",   0.0)) / 100 for t in TICKERS}
+            h_snap  = {t: float(st.session_state.get(f"hold_{t}", 0.0)) for t in ACTIVE_TICKERS}
+            bl_snap = {t: float(st.session_state.get(f"bl_{t}",   0.0)) / 100 for t in ACTIVE_TICKERS}
             ps_snap = float(st.session_state.get("portfolio_size_input", st.session_state.portfolio_size))
             saved_at = _save_state(h_snap, bl_snap, ps_snap)
             st.session_state.holdings       = h_snap
@@ -1767,9 +2078,10 @@ with tab6:
     # Export: generate a JSON string the user can copy
     with ctrl_export:
         export_data = json.dumps({
-            "holdings":      st.session_state.holdings,
-            "bl_weights":    st.session_state.bl_weights,
+            "holdings":       st.session_state.holdings,
+            "bl_weights":     st.session_state.bl_weights,
             "portfolio_size": st.session_state.portfolio_size,
+            "custom_tickers": st.session_state.get("custom_tickers", []),
         }, indent=2)
         st.download_button(
             "📥 Export JSON",
@@ -1786,9 +2098,15 @@ with tab6:
             if st.button("Load from JSON"):
                 try:
                     imported = json.loads(pasted)
-                    st.session_state.holdings       = {t: float(imported.get("holdings",   {}).get(t, 0.0)) for t in TICKERS}
-                    st.session_state.bl_weights     = {t: float(imported.get("bl_weights", {}).get(t, 0.0)) for t in TICKERS}
+                    st.session_state.holdings       = {t: float(imported.get("holdings",   {}).get(t, 0.0)) for t in ACTIVE_TICKERS}
+                    st.session_state.bl_weights     = {t: float(imported.get("bl_weights", {}).get(t, 0.0)) for t in ACTIVE_TICKERS}
                     st.session_state.portfolio_size = float(imported.get("portfolio_size", 25_000.0))
+                    # Restore custom tickers — filter out any already in core
+                    _imported_custom = [
+                        t.upper() for t in imported.get("custom_tickers", [])
+                        if t.upper() not in TICKERS
+                    ]
+                    st.session_state.custom_tickers = _imported_custom
                     _save_state(st.session_state.holdings, st.session_state.bl_weights,
                                 st.session_state.portfolio_size)
                     st.success("✅ Imported and saved.")
@@ -1797,17 +2115,21 @@ with tab6:
                     st.error(f"Invalid JSON: {e}")
 
     st.markdown("Enter your current positions. Hit **💾 Save** after editing.")
+    if st.session_state.get("custom_tickers"):
+        st.caption(f"✦ = custom rotation candidate: {', '.join(st.session_state.custom_tickers)}")
 
     # Holdings input grid — 4 columns
-    tickers_list = TICKERS
+    tickers_list = ACTIVE_TICKERS
     for row_start in range(0, len(tickers_list), 4):
         row_tickers = tickers_list[row_start: row_start + 4]
         row_cols    = st.columns(4)
         for col, t in zip(row_cols, row_tickers):
             with col:
                 price_now = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
+                _is_custom = t in st.session_state.get("custom_tickers", [])
+                _label = f"{'✦ ' if _is_custom else ''}{t}  (${price_now:,.0f}/sh)"
                 col.number_input(
-                    f"{t}  (${price_now:,.0f}/sh)",
+                    _label,
                     min_value=0.0,
                     value=float(st.session_state.holdings.get(t, 0.0)),
                     step=0.1,
@@ -1817,7 +2139,7 @@ with tab6:
     # Derive live portfolio value from widget state (not session_state.holdings —
     # that only updates on Save; widgets are always current)
     current_values = {}
-    for t in TICKERS:
+    for t in ACTIVE_TICKERS:
         shares    = float(st.session_state.get(f"hold_{t}", st.session_state.holdings.get(t, 0.0)))
         price_now = float(closes[t].iloc[-1]) if t in closes.columns else 0.0
         current_values[t] = shares * price_now
@@ -1866,7 +2188,8 @@ with tab6:
     )
     st.caption(
         "💡 Tip: copy the 'BL Optimised' column from the Views, Returns & Weights tab "
-        "of the Portfolio Optimiser app directly into these fields."
+        "of the Portfolio Optimiser app directly into these fields. "
+        "Custom tickers (✦) default to 0% — set a weight only if you want to rotate into them."
     )
 
     for row_start in range(0, len(tickers_list), 4):
@@ -1874,8 +2197,10 @@ with tab6:
         row_cols    = st.columns(4)
         for col, t in zip(row_cols, row_tickers):
             with col:
+                _is_custom = t in st.session_state.get("custom_tickers", [])
+                _label = f"{'✦ ' if _is_custom else ''}{t} BL wt (%)"
                 col.number_input(
-                    f"{t} BL wt (%)",
+                    _label,
                     min_value=0.0, max_value=100.0,
                     value=float(st.session_state.bl_weights.get(t, 0.0)) * 100,
                     step=0.5,
@@ -1883,7 +2208,7 @@ with tab6:
                 )
 
     # Read BL weights from widget state
-    bl_live = {t: float(st.session_state.get(f"bl_{t}", 0.0)) / 100 for t in TICKERS}
+    bl_live = {t: float(st.session_state.get(f"bl_{t}", 0.0)) / 100 for t in ACTIVE_TICKERS}
     bl_total = sum(bl_live.values())
     if abs(bl_total - 1.0) > 0.02 and bl_total > 0:
         st.warning(f"⚠️ BL weights sum to **{bl_total:.1%}** — should be ~100%. "
@@ -1924,7 +2249,7 @@ with tab6:
         st.info("Enter your BL target weights above to generate the trade list.")
     else:
         trade_rows = []
-        for t in TICKERS:
+        for t in ACTIVE_TICKERS:
             target_wt   = bl_live.get(t, 0.0)
             current_wt  = current_values.get(t, 0.0) / portfolio_size
             delta_wt    = target_wt - current_wt
@@ -2034,6 +2359,7 @@ with tab6:
             )
 
             verdict_rows = []
+            verdict_details = {}   # ticker → full scorecard dict
             for t in trade_df.index:
                 direction = trade_df.loc[t, "Direction"]
                 try:
@@ -2048,51 +2374,135 @@ with tab6:
                 except Exception:
                     continue
 
-                verdict, v_color, reason = score_entry_timing(
-                    t, fd_t, current_regime_plan, prob_up_now, direction
-                )
+                sc = score_entry_timing(t, fd_t, current_regime_plan, prob_up_now, direction)
+                verdict_details[t] = sc
 
-                last_fd  = fd_t.iloc[-1]
                 verdict_rows.append({
-                    "Ticker":       t,
-                    "Direction":    direction,
-                    "Verdict":      verdict,
-                    "Regime":       regime_now_label,
-                    "P(Up) ML":     f"{prob_up_now:.1%}" if prob_up_now is not None else "N/A",
-                    "RSI":          f"{last_fd['rsi_14']:.1f}",
-                    "MACD":         "↑" if last_fd["macd_hist"] > 0 else "↓",
-                    "vs SMA200":    f"{last_fd['price_vs_sma200']:+.1%}",
-                    "Reasoning":    reason,
-                    "_color":       v_color,
+                    "Ticker":      t,
+                    "Direction":   direction,
+                    "Verdict":     sc["verdict"],
+                    "Confidence":  sc["confidence_pct"],
+                    "For":         sc["agree"],
+                    "Against":     sc["oppose"],
+                    "Score":       round(sc["score"], 2),
+                    "_colour":     sc["colour"],
                 })
 
             if verdict_rows:
-                # Priority sort: execute now first, then caution, then wait
                 priority = {"✅ Execute now": 0, "⚠️ Proceed with caution": 1,
                             "🔴 Wait for better entry": 2}
                 verdict_rows.sort(key=lambda r: priority.get(r["Verdict"], 3))
 
-                verdict_df = pd.DataFrame(verdict_rows).set_index("Ticker")
-                verdict_display = verdict_df.drop(columns=["_color"])
+                # ── Summary table ─────────────────────────────────────────────
+                st.markdown("**Summary — sorted by priority**")
+                summary_df = pd.DataFrame(verdict_rows).set_index("Ticker").drop(columns=["_colour"])
 
                 def style_verdict(val):
-                    if "Execute" in str(val):   return "color: #1D9E75; font-weight:600"
-                    if "caution" in str(val):   return "color: #F5A623; font-weight:600"
-                    if "Wait"    in str(val):   return "color: #D85A30; font-weight:600"
+                    if "Execute" in str(val): return "color:#1D9E75; font-weight:600"
+                    if "caution" in str(val): return "color:#F5A623; font-weight:600"
+                    if "Wait"    in str(val): return "color:#D85A30; font-weight:600"
                     return ""
 
-                styled_verdict = (
-                    verdict_display.style
+                st.dataframe(
+                    summary_df.style
                     .map(style_verdict, subset=["Verdict"])
                     .map(highlight_direction, subset=["Direction"])
+                    .background_gradient(subset=["Confidence"], cmap="RdYlGn", vmin=0, vmax=100)
+                    .format({"Confidence": "{:.0f}%", "Score": "{:+.2f}"}),
+                    width="stretch",
+                    column_config={
+                        "Verdict":    st.column_config.TextColumn("Verdict",    width="medium"),
+                        "Confidence": st.column_config.TextColumn("Confidence", width="small"),
+                        "For":        st.column_config.TextColumn("✅ For",     width="small"),
+                        "Against":    st.column_config.TextColumn("❌ Against", width="small"),
+                        "Score":      st.column_config.TextColumn("Score",      width="small"),
+                    }
                 )
-                st.dataframe(styled_verdict, width="stretch",
-                             column_config={
-                                 "Reasoning": st.column_config.TextColumn(
-                                     "Reasoning", width="large"),
-                                 "Verdict":   st.column_config.TextColumn(
-                                     "Verdict", width="medium"),
-                             })
+
+                # ── Per-ticker expander scorecards ────────────────────────────
+                st.divider()
+                st.markdown("**Per-trade signal scorecard** — expand any row for full detail")
+
+                VOTE_ICON  = {+1: "✅", 0: "➖", -1: "❌"}
+                VOTE_COLOR = {+1: "#1D9E75", 0: "#8b949e", -1: "#D85A30"}
+
+                for row in verdict_rows:
+                    t    = row["Ticker"]
+                    sc   = verdict_details[t]
+                    conf = sc["confidence_pct"]
+                    bar_filled = int(conf / 10)  # out of 10 blocks
+
+                    # Confidence bar using Unicode blocks
+                    bar = ("█" * bar_filled) + ("░" * (10 - bar_filled))
+                    bar_color = "#1D9E75" if conf >= 60 else ("#F5A623" if conf >= 40 else "#D85A30")
+
+                    expander_label = (
+                        f"{t}  ·  {row['Direction']}  ·  {sc['verdict']}  "
+                        f"·  {sc['agree']}/{sc['n_signals']} signals agree"
+                    )
+                    with st.expander(expander_label, expanded=False):
+
+                        # Top row: verdict badge + confidence bar
+                        col_v, col_b = st.columns([1, 2])
+                        with col_v:
+                            st.markdown(
+                                f"<div style='font-size:1.1rem; font-weight:700; color:{sc['colour']};'>"
+                                f"{sc['verdict']}</div>"
+                                f"<div style='font-size:0.8rem; color:#8b949e;'>Score: {sc['score']:+.2f} "
+                                f"(range −1 to +1)</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with col_b:
+                            st.markdown(
+                                f"<div style='font-size:0.75rem; color:#8b949e; margin-bottom:2px;'>"
+                                f"Signal confidence</div>"
+                                f"<div style='font-family: monospace; font-size:1.1rem; "
+                                f"color:{bar_color}; letter-spacing:2px;'>{bar}</div>"
+                                f"<div style='font-size:0.75rem; color:#8b949e;'>"
+                                f"{conf}% of signals favour this trade "
+                                f"({sc['agree']} for, {sc['oppose']} against, "
+                                f"{sc['n_signals'] - sc['agree'] - sc['oppose']} neutral)</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        st.markdown("---")
+
+                        # Plain-English top reasons
+                        if sc["top_reasons"]:
+                            st.markdown("**Why:**")
+                            for side, reason_text in sc["top_reasons"]:
+                                icon = "✅" if side == "for" else "⚠️"
+                                st.markdown(f"{icon} {reason_text}")
+
+                        st.markdown("---")
+
+                        # Per-signal scorecard
+                        st.markdown("**Signal breakdown:**")
+                        sig_cols = st.columns([2, 1, 4])
+                        sig_cols[0].markdown("**Signal**")
+                        sig_cols[1].markdown("**Value · Vote**")
+                        sig_cols[2].markdown("**Reasoning**")
+
+                        for sig in sc["signals"]:
+                            vote = sig["vote"]
+                            icon = VOTE_ICON[vote]
+                            col_col = VOTE_COLOR[vote]
+                            reason_text = (sig["reason_for"] if vote >= 0
+                                           else sig["reason_against"])
+                            c1, c2, c3 = st.columns([2, 1, 4])
+                            c1.markdown(
+                                f"<span style='color:#c9d1d9;'>{sig['name']}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            c2.markdown(
+                                f"<span style='color:#8b949e; font-size:0.8rem;'>{sig['value']}</span> "
+                                f"<span style='font-size:1rem;'>{icon}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            c3.markdown(
+                                f"<span style='color:{col_col}; font-size:0.82rem;'>{reason_text}</span>",
+                                unsafe_allow_html=True,
+                            )
 
             # ── SECTION 4: Rebalancing Waterfall ──────────────────────────────
             st.divider()
@@ -2177,6 +2587,358 @@ with tab6:
                 "transaction costs at your scale — but timing the entry via the verdict table "
                 "above can save you 0.3–1.0% of slippage on volatile names."
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — SIGNAL AUDIT
+# ══════════════════════════════════════════════════════════════════════════════
+with tab7:
+    st.markdown("#### 🔍 Signal Audit — Can You Trust What This App Is Saying?")
+    st.markdown(
+        "This tab answers three questions that determine whether the signals in this app "
+        "are actually worth following:\n\n"
+        "1. **Backtest** — if you had followed the buy/sell signals historically, what happened?\n"
+        "2. **Correlation** — are the 7 scoring signals genuinely independent, or are some redundant?\n"
+        "3. **Calibration** — when the ML model says 70% probability of up, does the stock go up 70% of the time?\n\n"
+        "All three analyses run on the selected stock using only historical data — "
+        "no look-ahead bias, no cherry-picking."
+    )
+
+    audit_ticker = st.selectbox(
+        "Audit stock", ACTIVE_TICKERS,
+        index=ACTIVE_TICKERS.index(selected_ticker) if selected_ticker in ACTIVE_TICKERS else 0,
+        key="audit_ticker",
+    )
+
+    try:
+        audit_price = closes[audit_ticker].dropna()
+        audit_vol   = volumes[audit_ticker].dropna()
+        audit_fd    = compute_features(audit_price, audit_vol)
+    except Exception as e:
+        st.error(f"Could not compute features for {audit_ticker}: {e}")
+        st.stop()
+
+    audit_lookahead = st.slider(
+        "Forward return window (days)", 1, 21, lookahead, 1, key="audit_lookahead",
+        help="How many days forward to measure each signal's outcome.",
+    )
+
+    st.divider()
+
+    # ── A: BACKTEST ───────────────────────────────────────────────────────────
+    st.markdown("### A. Backtest — Did the signals predict future returns?")
+    st.markdown(
+        f"For every historical day, compute the verdict that would have been given, "
+        f"then measure the actual **{audit_lookahead}-day return** that followed. "
+        "Execute days should show higher returns than Wait days if the signals have edge."
+    )
+    st.caption(
+        "⚠️ Technical and regime signals are rule-based (no training = clean backtest). "
+        "The ML component is trained on 70% of data — its backtest here covers the OOS 30% only."
+    )
+
+    with st.spinner(f"Running backtest for {audit_ticker}…"):
+        fwd_ret = np.log(
+            audit_price.shift(-audit_lookahead) / audit_price
+        ).reindex(audit_fd.index).dropna()
+
+        try:
+            ml_probs_bt, _, _, _ = train_ml_model(audit_fd, lookahead=audit_lookahead)
+        except Exception:
+            ml_probs_bt = pd.Series(dtype=float)
+
+        spy_ret_bt = np.log(spy / spy.shift(1)).dropna()
+        try:
+            regimes_bt, _, _ = fit_hmm(spy_ret_bt, n_regimes=n_regimes)
+        except Exception:
+            regimes_bt = pd.Series(1, index=spy_ret_bt.index)
+
+        common_idx = fwd_ret.index.intersection(ml_probs_bt.index)
+        bt_rows = []
+        for day in common_idx:
+            if day not in audit_fd.index:
+                continue
+            day_fd     = audit_fd.loc[:day].tail(1)
+            regime_day = int(regimes_bt.get(day, 1))
+            prob_day   = float(ml_probs_bt.get(day, 0.5))
+            fwd        = float(fwd_ret.loc[day])
+            sc_day     = score_entry_timing(audit_ticker, day_fd, regime_day, prob_day, "BUY")
+            bt_rows.append({"date": day, "verdict": sc_day["verdict"],
+                             "score": sc_day["score"], "fwd_ret": fwd})
+
+        bt_df = pd.DataFrame(bt_rows).set_index("date")
+
+    if len(bt_df) > 20:
+        col_bt1, col_bt2 = st.columns([3, 2])
+        v_order  = ["✅ Execute now", "⚠️ Proceed with caution", "🔴 Wait for better entry"]
+        v_colors = ["#1D9E75", "#F5A623", "#D85A30"]
+
+        with col_bt1:
+            st.markdown(f"##### {audit_lookahead}-Day Return Distribution by Verdict")
+            fig_bt = go.Figure()
+            for v_label, v_col in zip(v_order, v_colors):
+                subset = bt_df[bt_df["verdict"] == v_label]["fwd_ret"]
+                if len(subset) < 3:
+                    continue
+                fig_bt.add_trace(go.Histogram(
+                    x=subset, name=v_label, nbinsx=40,
+                    marker_color=v_col, opacity=0.65, histnorm="probability",
+                ))
+            fig_bt.add_vline(x=0, line_color="#8b949e", line_dash="dash")
+            fig_bt.update_layout(
+                barmode="overlay", height=300, margin=dict(t=20, b=10),
+                xaxis=dict(title=f"{audit_lookahead}d log-return",
+                           tickformat=".1%", gridcolor="#30363d"),
+                yaxis=dict(title="Probability", gridcolor="#30363d"),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", y=1.12, font_size=10),
+            )
+            st.plotly_chart(fig_bt, width="stretch")
+
+        with col_bt2:
+            st.markdown("##### Average Outcome per Verdict")
+            summary_bt = bt_df.groupby("verdict")["fwd_ret"].agg(
+                ["mean", "std", "count", lambda x: (x > 0).mean()]
+            ).rename(columns={"mean": "Avg Ret", "std": "Std Dev",
+                               "count": "N Days", "<lambda_0>": "Win Rate"})
+            summary_bt = summary_bt.reindex([v for v in v_order if v in summary_bt.index])
+            st.dataframe(
+                summary_bt.style.format({
+                    "Avg Ret":  "{:+.2%}",
+                    "Std Dev":  "{:.2%}",
+                    "Win Rate": "{:.1%}",
+                }),
+                width="stretch",
+            )
+            st.caption(
+                "Execute days should have higher average return and win rate than Wait days. "
+                "If they don't differ, the signal has no edge for this stock."
+            )
+
+        execute_mask = bt_df["verdict"] == "✅ Execute now"
+        if execute_mask.sum() > 30:
+            st.markdown(f"##### Rolling 60-day Win Rate (Execute days)")
+            roll_acc = (bt_df.loc[execute_mask, "fwd_ret"] > 0).rolling(60, min_periods=20).mean()
+            fig_roll = go.Figure()
+            fig_roll.add_hline(y=0.5, line_dash="dash", line_color="#8b949e",
+                                annotation_text="50% baseline")
+            fig_roll.add_trace(go.Scatter(
+                x=roll_acc.index, y=roll_acc.values,
+                line=dict(color="#1D9E75", width=1.5), fill="tozeroy",
+                fillcolor="rgba(29,158,117,0.1)", name="Win rate",
+            ))
+            fig_roll.update_layout(
+                height=200, margin=dict(t=20, b=10),
+                yaxis=dict(tickformat=".0%", range=[0, 1], gridcolor="#30363d"),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig_roll, width="stretch")
+            st.caption("Sustained periods above 55% indicate genuine edge. Near 50% = noise.")
+    else:
+        st.info("Not enough data for backtest — try an earlier data start date.")
+
+    # ── B: CORRELATION ────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### B. Signal Correlation — Which signals are redundant?")
+    st.markdown(
+        "High correlation (|r| > 0.7) between two signals means they carry the same "
+        "information. The scoring function still counts them as two independent votes, "
+        "which inflates confidence without adding evidence. Values near 0 = independent."
+    )
+
+    try:
+        ml_probs_corr, _, _, _ = train_ml_model(audit_fd, lookahead=audit_lookahead)
+        regimes_corr, _, _ = fit_hmm(np.log(spy / spy.shift(1)).dropna(), n_regimes=n_regimes)
+
+        sig_df = pd.DataFrame({
+            "Regime":    regimes_corr.reindex(audit_fd.index).fillna(1),
+            "RSI":       audit_fd["rsi_14"],
+            "MACD":      audit_fd["macd_hist"],
+            "vs SMA200": audit_fd["price_vs_sma200"],
+            "BB %B":     audit_fd["bb_pct"],
+            "Vol Ratio": audit_fd["vol_ratio"],
+            "ML P(Up)":  ml_probs_corr.reindex(audit_fd.index),
+        }).dropna()
+
+        corr_matrix = sig_df.corr()
+        fig_corr = px.imshow(
+            corr_matrix, color_continuous_scale="RdYlGn",
+            zmin=-1, zmax=1, text_auto=".2f",
+        )
+        fig_corr.update_layout(height=420, margin=dict(t=20, b=10),
+                                paper_bgcolor="rgba(0,0,0,0)")
+
+        col_c1, col_c2 = st.columns([3, 2])
+        with col_c1:
+            st.plotly_chart(fig_corr, width="stretch")
+        with col_c2:
+            st.markdown("##### High-correlation pairs (|r| > 0.5)")
+            sig_names_corr = list(corr_matrix.columns)
+            high_corr = []
+            for i in range(len(sig_names_corr)):
+                for j in range(i+1, len(sig_names_corr)):
+                    r = corr_matrix.iloc[i, j]
+                    if abs(r) > 0.5:
+                        high_corr.append({
+                            "Signal A": sig_names_corr[i],
+                            "Signal B": sig_names_corr[j],
+                            "r":        round(r, 3),
+                            "Status":   "Redundant" if abs(r) > 0.7 else "Overlapping",
+                        })
+            if high_corr:
+                st.dataframe(
+                    pd.DataFrame(high_corr).style
+                    .background_gradient(subset=["r"], cmap="RdYlGn", vmin=-1, vmax=1),
+                    width="stretch",
+                )
+                st.caption(
+                    "**Redundant** pairs (|r| > 0.7) count as two votes but carry one signal's "
+                    "worth of information. This inflates confidence for correlated clusters."
+                )
+            else:
+                st.success("✅ All signal pairs |r| < 0.5 — no redundancy concern.")
+    except Exception as e:
+        st.warning(f"Could not compute correlation matrix: {e}")
+
+    # ── C: CALIBRATION ────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### C. Calibration — Does P(up) = 70% mean up 70% of the time?")
+    st.markdown(
+        "A well-calibrated model follows the diagonal — predicted probability equals "
+        "actual frequency. Above diagonal = under-confident. Below = over-confident. "
+        "Bubble size = number of observations in that probability bin."
+    )
+
+    try:
+        cal_probs, _, _, _ = train_ml_model(audit_fd, lookahead=audit_lookahead)
+        actual_up = (np.log(
+            audit_price.shift(-audit_lookahead) / audit_price
+        ) > 0).reindex(cal_probs.index)
+
+        cal_df = pd.DataFrame({"prob": cal_probs, "actual": actual_up}).dropna()
+        cal_df["bin"] = pd.cut(cal_df["prob"], bins=10,
+                                labels=[f"{i*10+5}%" for i in range(10)])
+        cal_summary = cal_df.groupby("bin", observed=True).agg(
+            predicted=("prob",   "mean"),
+            actual    =("actual", "mean"),
+            n         =("actual", "count"),
+        ).dropna()
+
+        brier       = float(((cal_df["prob"] - cal_df["actual"].astype(float)) ** 2).mean())
+        brier_skill = 1 - brier / 0.25
+
+        fig_cal = go.Figure()
+        fig_cal.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line=dict(color="#8b949e", dash="dash"), name="Perfect calibration",
+        ))
+        fig_cal.add_trace(go.Scatter(
+            x=cal_summary["predicted"], y=cal_summary["actual"],
+            mode="lines+markers",
+            line=dict(color="#1D9E75", width=2),
+            marker=dict(size=cal_summary["n"] / cal_summary["n"].max() * 20 + 4,
+                        color="#1D9E75"),
+            name="Model",
+            hovertemplate="Predicted: %{x:.0%}<br>Actual: %{y:.0%}<extra></extra>",
+        ))
+        fig_cal.update_layout(
+            height=340, margin=dict(t=20, b=10),
+            xaxis=dict(title="Predicted P(up)", tickformat=".0%",
+                       range=[0, 1], gridcolor="#30363d"),
+            yaxis=dict(title="Actual win rate", tickformat=".0%",
+                       range=[0, 1], gridcolor="#30363d"),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", y=1.1),
+        )
+
+        col_ca1, col_ca2 = st.columns([3, 2])
+        with col_ca1:
+            st.plotly_chart(fig_cal, width="stretch")
+        with col_ca2:
+            st.metric("Brier Score", f"{brier:.3f}",
+                      help="Lower is better. 0.25 = random, 0 = perfect.")
+            st.metric("Skill vs. Random", f"{brier_skill:+.1%}",
+                      help="Positive = better than random.")
+            st.markdown("---")
+            st.dataframe(
+                cal_summary.style.format({
+                    "predicted": "{:.0%}", "actual": "{:.0%}", "n": "{:.0f}",
+                }),
+                width="stretch",
+            )
+            st.caption(
+                "Brier < 0.20 = good. 0.20–0.25 = marginal edge. "
+                "> 0.25 = worse than random for that bin."
+            )
+    except Exception as e:
+        st.warning(f"Could not compute calibration: {e}")
+
+    # ── D: PER-SIGNAL HIT RATES ───────────────────────────────────────────────
+    st.divider()
+    st.markdown("### D. Per-Signal Hit Rates — Which signals actually work for this stock?")
+    st.markdown(
+        f"When each signal alone fires 'bullish', what fraction of the following "
+        f"{audit_lookahead}-day periods were actually positive? "
+        "**50% = coin flip. >55% = useful. >60% = strong. <50% = contrarian for this stock.**"
+    )
+
+    try:
+        regimes_hr, _, _ = fit_hmm(np.log(spy / spy.shift(1)).dropna(), n_regimes=n_regimes)
+        ml_probs_hr, _, _, _ = train_ml_model(audit_fd, lookahead=audit_lookahead)
+
+        fwd_hr  = (np.log(audit_price.shift(-audit_lookahead) / audit_price) > 0
+                   ).reindex(audit_fd.index)
+        common  = audit_fd.index.intersection(fwd_hr.dropna().index)
+        fwd_c   = fwd_hr.reindex(common)
+        regime_c = regimes_hr.reindex(common).fillna(1)
+        ml_c    = ml_probs_hr.reindex(common).fillna(0.5)
+
+        checks = [
+            ("Market Regime (Bull)",  (regime_c == 0)),
+            ("RSI < 55",              (audit_fd["rsi_14"].reindex(common) < 55)),
+            ("MACD positive",         (audit_fd["macd_hist"].reindex(common) > 0)),
+            ("Above SMA200",          (audit_fd["price_vs_sma200"].reindex(common) > 0)),
+            ("BB %B < 0.75",          (audit_fd["bb_pct"].reindex(common) < 0.75)),
+            ("Low vol ratio (<1.1)",  (audit_fd["vol_ratio"].reindex(common) < 1.1)),
+            ("ML P(Up) > 55%",        (ml_c > 0.55)),
+        ]
+
+        hit_rows = []
+        for sig_name, sig_mask in checks:
+            n_days = int(sig_mask.sum())
+            if n_days < 10:
+                hit_rows.append({"Signal": sig_name, "N days": n_days,
+                                  "Win Rate": None, "Edge vs 50%": None,
+                                  "Assessment": "Too few obs"})
+                continue
+            win_rate = float(fwd_c[sig_mask].mean())
+            edge     = win_rate - 0.5
+            assess   = ("Strong ✅"      if edge > 0.10 else
+                        "Useful ✓"       if edge > 0.05 else
+                        "Marginal"       if edge > 0    else
+                        "Contrarian ⚠️"  if edge > -0.05 else
+                        "Inverse ❌")
+            hit_rows.append({"Signal": sig_name, "N days": n_days,
+                              "Win Rate": win_rate, "Edge vs 50%": edge,
+                              "Assessment": assess})
+
+        hit_df = pd.DataFrame(hit_rows).set_index("Signal")
+        st.dataframe(
+            hit_df.style
+            .format({"Win Rate": "{:.1%}", "Edge vs 50%": "{:+.1%}",
+                     "N days": "{:.0f}"}, na_rep="—")
+            .background_gradient(subset=["Win Rate"], cmap="RdYlGn", vmin=0.40, vmax=0.65),
+            width="stretch",
+        )
+        st.caption(
+            "Signals marked **Contrarian** or **Inverse** work backwards for this stock. "
+            "This tells you where equal-weighting breaks down — and which signals "
+            "deserve more or less influence in the scoring function."
+        )
+
+    except Exception as e:
+        st.warning(f"Could not compute hit rates: {e}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
