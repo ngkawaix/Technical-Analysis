@@ -186,12 +186,13 @@ def compute_features(prices: pd.Series, volumes: pd.Series) -> pd.DataFrame:
     df["bb_pct"]   = (df["close"] - lower_bb) / (upper_bb - lower_bb + 1e-9)
     df["bb_width"] = (upper_bb - lower_bb) / (sma20 + 1e-9)
 
-    # ATR
+    # ATR (Average True Range)
+    # Without OHLC data, the True Range proxy is |close − prev_close|.
+    # The full True Range = max(H−L, |H−Cp|, |L−Cp|) requires tick data.
+    # Note: the original code used pd.concat([close-close, ...]) where
+    # close-close is always zero — that first term was a no-op.
     prev_close = df["close"].shift(1)
-    df["atr_14"] = pd.concat([
-        (df["close"] - df["close"]).abs(),   # placeholder for high-low (using close diff)
-        (df["close"] - prev_close).abs(),
-    ], axis=1).max(axis=1).rolling(14).mean()
+    df["atr_14"] = (df["close"] - prev_close).abs().rolling(14).mean()
 
     # Volatility
     df["vol_21"]   = df["ret_1d"].rolling(21).std() * np.sqrt(252)
@@ -762,7 +763,15 @@ with st.sidebar:
     st.caption("Technical Analysis — ML Edition")
     st.divider()
 
-    # ── Custom ticker universe management ─────────────────────────────────────
+    # ── 1. DATA START — set first so validation uses the correct window ────────
+    data_start = st.date_input("Data start", value=date(2018, 1, 1),
+                               min_value=date(2015, 1, 1),
+                               max_value=(datetime.today() - timedelta(days=365*2)).date())
+    # Store for use in custom-ticker validation below
+    st.session_state.sidebar_data_start = data_start.strftime("%Y-%m-%d")
+    st.divider()
+
+    # ── 2. CUSTOM TICKER UNIVERSE ─────────────────────────────────────────────
     # Persist custom tickers in session_state, loaded from portfolio_state.json
     # on first boot (same file as holdings/BL weights — single source of truth).
     import json as _json
@@ -857,19 +866,27 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Other settings ────────────────────────────────────────────────────────
-    n_regimes = st.radio("HMM Regime Count", [2, 3], index=1, horizontal=True)
+    # ── 3. STOCK SELECTOR — right after universe is finalised ─────────────────
+    _ACTIVE_TICKERS_SB = sorted(set(TICKERS + st.session_state.get("custom_tickers", [])))
+    _default_idx = _ACTIVE_TICKERS_SB.index("NVDA") if "NVDA" in _ACTIVE_TICKERS_SB else 0
+    selected_ticker = st.selectbox(
+        "🔍 Analyse stock", _ACTIVE_TICKERS_SB, index=_default_idx,
+        help="Drives Overview, Technicals, ML Signals, and LSTM tabs.",
+    )
+    st.divider()
+
+    # ── 4. MODEL PARAMETERS ────────────────────────────────────────────────────
+    st.subheader("⚙️ Model Parameters")
+    n_regimes = st.radio("HMM Regime Count", [2, 3], index=1, horizontal=True,
+                         help="Number of hidden market states the HMM fits. 3 = Bull / Transitional / Bear.")
     lookahead = st.slider("ML signal lookahead (days)", 1, 21, 5, 1,
                           help="How many days ahead the RF/XGB model targets. "
                                "5d = one trading week.")
-    lstm_horizon = st.slider("LSTM forecast horizon (days)", 3, 21, 5, 1)
+    lstm_horizon = st.slider("LSTM forecast horizon (days)", 3, 21, 5, 1,
+                             help="Prediction horizon for the deep learning sequence model.")
     st.divider()
-    data_start = st.date_input("Data start", value=date(2018, 1, 1),
-                               min_value=date(2015, 1, 1),
-                               max_value=(datetime.today() - timedelta(days=365*2)).date())
-    # Store for use in validation
-    st.session_state.sidebar_data_start = data_start.strftime("%Y-%m-%d")
-    st.divider()
+
+    # ── 5. APP GUIDE ──────────────────────────────────────────────────────────
     st.caption("💡 **How the app fits together:**\n\n"
                "- **Overview**: daily dashboard of all signals in one glance\n"
                "- **Technicals**: classic indicators explained\n"
@@ -889,13 +906,6 @@ start_str = data_start.strftime("%Y-%m-%d")
 with st.spinner("Loading price & volume data for the full universe…"):
     closes, volumes = load_prices(tuple(ACTIVE_TICKERS), start=start_str)
     spy = load_spy(start=start_str)
-
-# Selected ticker for single-stock tabs — placed here so ACTIVE_TICKERS is available
-_default_idx = ACTIVE_TICKERS.index("NVDA") if "NVDA" in ACTIVE_TICKERS else 0
-selected_ticker = st.sidebar.selectbox(
-    "Analyse stock", ACTIVE_TICKERS, index=_default_idx,
-    help="Drives Overview, Technicals, ML Signals, and LSTM tabs.",
-)
 
 # Filter to selected ticker
 price_s  = closes[selected_ticker].dropna()
@@ -1938,9 +1948,12 @@ with tab6:
             })
 
         # 7. ML Model P(Up) — data-driven signal
+        # Threshold raised to 0.60/0.40: at ±5% of 50% the model rarely has
+        # calibrated edge (Brier scores close to 0.25). Only give a strong vote
+        # at meaningful conviction levels.
         if prob_up is not None:
             if direction == "BUY":
-                rv = +1 if prob_up > 0.55 else (-1 if prob_up < 0.45 else 0)
+                rv = +1 if prob_up > 0.60 else (-1 if prob_up < 0.40 else 0)
                 raw_signals.append({
                     "name":  "ML Signal",
                     "vote":  rv,
@@ -1949,7 +1962,7 @@ with tab6:
                     "reason_against": f"ML model only estimates {prob_up:.1%} chance of up — weak conviction.",
                 })
             else:
-                rv = +1 if prob_up < 0.45 else (-1 if prob_up > 0.55 else 0)
+                rv = +1 if prob_up < 0.40 else (-1 if prob_up > 0.60 else 0)
                 raw_signals.append({
                     "name":  "ML Signal",
                     "vote":  rv,
@@ -1963,10 +1976,14 @@ with tab6:
         n      = len(votes)
         score  = sum(votes) / n
 
-        # Confidence = % of signals that are non-neutral AND agree with direction
         agree  = sum(1 for v in votes if v == +1)
         oppose = sum(1 for v in votes if v == -1)
-        confidence_pct = int(100 * agree / n)
+
+        # Confidence = % of ACTIVE (non-neutral) signals that agree with direction.
+        # Dividing by n (total) dilutes the reading when many signals are neutral;
+        # dividing by n_active shows true conviction among signals that took a side.
+        n_active = max(1, agree + oppose)
+        confidence_pct = int(100 * agree / n_active)
 
         # Top reasons: strongest for + strongest against
         for_reasons     = [s["reason_for"]     for s in raw_signals if s["vote"] == +1]
@@ -1975,7 +1992,12 @@ with tab6:
         if for_reasons:     top_reasons.append(("for",     for_reasons[0]))
         if against_reasons: top_reasons.append(("against", against_reasons[0]))
 
-        if score >= 0.35:
+        # ── Verdict thresholds ────────────────────────────────────────────────
+        # Raised from 0.35 → 0.43: with 7 signals this requires at least 3 net
+        # positive votes (e.g. 5 for / 2 against), versus the old 0.35 which
+        # allowed 4 for / 1 against / 2 neutral.  More demanding = fewer false
+        # "Execute now" verdicts on marginal set-ups.
+        if score >= 0.43:
             verdict = "✅ Execute now"
             colour  = "#1D9E75"
         elif score >= 0.0:
@@ -1985,6 +2007,18 @@ with tab6:
             verdict = "🔴 Wait for better entry"
             colour  = "#D85A30"
 
+        # ── Regime hard-gate for BUY ──────────────────────────────────────────
+        # A Bear / High-Vol regime (regime 2) is not a valid backdrop for a new
+        # long entry, regardless of what individual technical signals say.
+        # Individual technicals can stay "green" while the market is in a bear
+        # regime (e.g. price above its own SMA200 but the overall market is in
+        # drawdown mode). Cap BUY verdicts at "Proceed with caution" in regime 2.
+        regime_override = False
+        if direction == "BUY" and regime == 2 and verdict == "✅ Execute now":
+            verdict = "⚠️ Proceed with caution"
+            colour  = "#F5A623"
+            regime_override = True
+
         return {
             "verdict":         verdict,
             "colour":          colour,
@@ -1993,9 +2027,11 @@ with tab6:
             "agree":           agree,
             "oppose":          oppose,
             "n_signals":       n,
+            "n_active":        n_active,
             "signals":         raw_signals,
             "top_reasons":     top_reasons,
             "regime_label":    regime_label,
+            "regime_override": regime_override,
         }
 
     # ── PERSISTENCE HELPERS ───────────────────────────────────────────────────
@@ -2425,11 +2461,13 @@ with tab6:
                     .format({"Confidence": "{:.0f}%", "Score": "{:+.2f}"}),
                     width="stretch",
                     column_config={
-                        "Verdict":    st.column_config.TextColumn("Verdict",    width="medium"),
-                        "Confidence": st.column_config.TextColumn("Confidence", width="small"),
-                        "For":        st.column_config.TextColumn("✅ For",     width="small"),
-                        "Against":    st.column_config.TextColumn("❌ Against", width="small"),
-                        "Score":      st.column_config.TextColumn("Score",      width="small"),
+                        "Verdict":    st.column_config.TextColumn("Verdict",       width="medium"),
+                        "Confidence": st.column_config.TextColumn("Signal Agr. %", width="small",
+                                        help="% of active (non-neutral) signals that agree. "
+                                             "Neutral votes are excluded from the denominator."),
+                        "For":        st.column_config.TextColumn("✅ For",        width="small"),
+                        "Against":    st.column_config.TextColumn("❌ Against",    width="small"),
+                        "Score":      st.column_config.TextColumn("Score",         width="small"),
                     }
                 )
 
@@ -2469,14 +2507,23 @@ with tab6:
                         with col_b:
                             st.markdown(
                                 f"<div style='font-size:0.75rem; color:#8b949e; margin-bottom:2px;'>"
-                                f"Signal confidence</div>"
+                                f"Signal agreement (active signals only)</div>"
                                 f"<div style='font-family: monospace; font-size:1.1rem; "
                                 f"color:{bar_color}; letter-spacing:2px;'>{bar}</div>"
                                 f"<div style='font-size:0.75rem; color:#8b949e;'>"
-                                f"{conf}% of signals favour this trade "
+                                f"{conf}% of active signals favour this trade "
                                 f"({sc['agree']} for, {sc['oppose']} against, "
                                 f"{sc['n_signals'] - sc['agree'] - sc['oppose']} neutral)</div>",
                                 unsafe_allow_html=True,
+                            )
+
+                        # Regime override banner
+                        if sc.get("regime_override"):
+                            st.warning(
+                                "⚠️ **Regime gate applied** — SPY HMM is in Bear / High-Vol "
+                                "regime. Verdict capped at *Proceed with caution* regardless "
+                                "of technical signals. Avoid opening new longs in a bear market.",
+                                icon=None,
                             )
 
                         st.markdown("---")
