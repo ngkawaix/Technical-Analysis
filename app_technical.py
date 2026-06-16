@@ -46,35 +46,53 @@ st.markdown("""
 
 html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 
-/* Sidebar */
+/* Sidebar stays dark — intentional contrast panel */
 [data-testid="stSidebar"] { background: #0d1117; }
 [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
 
-/* Metric cards */
+/* Metric cards — clean white with a subtle border, no dark background */
 [data-testid="stMetric"] {
-    background: #161b22;
-    border: 1px solid #30363d;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
     border-radius: 8px;
     padding: 12px 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
 }
-[data-testid="stMetricLabel"] { font-size: 0.72rem; color: #8b949e !important; text-transform: uppercase; letter-spacing: 0.05em; }
-[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; font-size: 1.35rem; color: #e6edf3 !important; }
+[data-testid="stMetricLabel"] {
+    font-size: 0.72rem;
+    color: #64748b !important;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+[data-testid="stMetricValue"] {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.35rem;
+    color: #1e293b !important;
+}
+[data-testid="stMetricDelta"] { font-size: 0.78rem; }
 
 /* Signal badge helper classes (applied via HTML) */
 .bull  { color: #1D9E75; font-weight: 600; }
 .bear  { color: #D85A30; font-weight: 600; }
-.neut  { color: #8b949e; font-weight: 500; }
+.neut  { color: #64748b; font-weight: 500; }
 
 /* Tab strip */
-[data-baseweb="tab-list"] { border-bottom: 1px solid #30363d; gap: 4px; }
+[data-baseweb="tab-list"] { border-bottom: 1px solid #e2e8f0; gap: 4px; }
 [data-baseweb="tab"] { font-size: 0.83rem; padding: 6px 14px; border-radius: 6px 6px 0 0; }
 
 /* Expander */
-details > summary { font-size: 0.85rem; color: #8b949e; }
+details > summary { font-size: 0.85rem; color: #64748b; }
 
-/* Mono code inline */
-code { background: #161b22; border: 1px solid #30363d; border-radius: 4px;
-       padding: 1px 5px; font-family: 'IBM Plex Mono', monospace; font-size: 0.82em; }
+/* Mono code inline — light background */
+code {
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82em;
+    color: #1e293b;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -999,7 +1017,7 @@ with tab0:
             st.markdown(
                 f"<div style='display:flex; justify-content:space-between; padding:6px 0; "
                 f"border-bottom:1px solid #30363d;'>"
-                f"<span style='color:#8b949e; font-size:0.82rem;'>{indicator}</span>"
+                f"<span style='color:#475569; font-size:0.82rem;'>{indicator}</span>"
                 f"<span class='{cls}' style='font-size:0.82rem;'>{value}</span></div>",
                 unsafe_allow_html=True,
             )
@@ -1242,7 +1260,7 @@ The HMM reverse-engineers the hidden mode from the observable outputs.
                                line_width=0)
 
     fig_reg.add_trace(go.Scatter(x=spy.index, y=spy.values,
-                                  line=dict(color="#c9d1d9", width=1.5), name="SPY"))
+                                  line=dict(color="#64748b", width=1.5), name="SPY"))
     fig_reg.update_layout(
         title="SPY Price with HMM Regime Overlay (colour = detected state)",
         height=360, margin=dict(t=40, b=10),
@@ -1398,7 +1416,7 @@ predicted up-moves for *this specific stock* over the *training period*.
                   for p in prob_series.values]
         fig_prob.add_trace(go.Scatter(
             x=prob_series.index, y=prob_series.values,
-            mode="lines", line=dict(color="#c9d1d9", width=1.2), showlegend=False,
+            mode="lines", line=dict(color="#94a3b8", width=1.2), showlegend=False,
         ))
         fig_prob.add_trace(go.Scatter(
             x=prob_series.index, y=prob_series.values,
@@ -2561,17 +2579,17 @@ with tab6:
                             st.markdown(
                                 f"<div style='font-size:1.1rem; font-weight:700; color:{sc['colour']};'>"
                                 f"{sc['verdict']}</div>"
-                                f"<div style='font-size:0.8rem; color:#8b949e;'>Score: {sc['score']:+.2f} "
+                                f"<div style='font-size:0.8rem; color:#475569;'>Score: {sc['score']:+.2f} "
                                 f"(range −1 to +1)</div>",
                                 unsafe_allow_html=True,
                             )
                         with col_b:
                             st.markdown(
-                                f"<div style='font-size:0.75rem; color:#8b949e; margin-bottom:2px;'>"
+                                f"<div style='font-size:0.75rem; color:#475569; margin-bottom:2px;'>"
                                 f"Signal agreement (IC-weighted)</div>"
                                 f"<div style='font-family: monospace; font-size:1.1rem; "
                                 f"color:{bar_color}; letter-spacing:2px;'>{bar}</div>"
-                                f"<div style='font-size:0.75rem; color:#8b949e;'>"
+                                f"<div style='font-size:0.75rem; color:#475569;'>"
                                 f"{conf}% of IC-weighted votes favour this trade "
                                 f"({sc['agree']} for, {sc['oppose']} against, "
                                 f"{sc['n_signals'] - sc['agree'] - sc['oppose']} neutral)</div>",
@@ -2649,11 +2667,11 @@ with tab6:
                             ic_note = " ⚠️" if sig.get("contrarian") else ""
                             c1, c2, c3, c4 = st.columns([2, 1, 1, 3])
                             c1.markdown(
-                                f"<span style='color:#c9d1d9;'>{sig['name']}</span>",
+                                f"<span style='color:#1e293b; font-weight:500;'>{sig['name']}</span>",
                                 unsafe_allow_html=True,
                             )
                             c2.markdown(
-                                f"<span style='color:#8b949e; font-size:0.8rem;'>{sig['value']}</span> "
+                                f"<span style='color:#475569; font-size:0.8rem;'>{sig['value']}</span> "
                                 f"<span style='font-size:1rem;'>{icon}</span>",
                                 unsafe_allow_html=True,
                             )
