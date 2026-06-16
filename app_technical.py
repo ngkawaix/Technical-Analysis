@@ -1798,101 +1798,162 @@ with tab6:
         }
 
     def score_entry_timing(ticker: str, feat_df: pd.DataFrame,
-                           regime: int, prob_up: float | None,
-                           direction: str) -> dict:
+                           regime: int, prob_up: "float | None",
+                           direction: str,
+                           lookahead: int = 5,
+                           ml_probs: "pd.Series | None" = None) -> dict:
         """
-        Synthesise regime + ML signal + technicals into a structured scorecard.
+        Institutional-grade signal scorecard using IC-weighted voting.
 
-        Returns a dict with:
-          verdict        : str  — "✅ Execute now" / "⚠️ Proceed with caution" / "🔴 Wait"
-          colour         : str  — hex colour
-          score          : float — normalised [-1, +1]
-          confidence_pct : int  — how many signals agree (0-100%)
-          signals        : list of dicts {name, vote(+1/0/-1), value, reason}
-          top_reasons    : list of 2 plain-English strings (strongest for + against)
-          regime_label   : str
+        What is IC (Information Coefficient)?
+        ──────────────────────────────────────
+        IC = Spearman rank-correlation between a signal's value and the
+        forward return it is trying to predict, computed on training data only.
+        It directly answers: 'When this signal fired historically, how well did
+        it predict direction for THIS stock?'
+
+          IC >  0.10  → Strong, reliable edge
+          IC   0–0.10 → Useful but modest
+          IC ≈  0     → Coin flip — signal adds nothing
+          IC <  0     → CONTRARIAN: the signal fires in the wrong direction
+
+        Two institutional properties this enables
+        ─────────────────────────────────────────
+        1. IC-weighted votes — signals with higher |IC| contribute proportionally
+           more to the composite score.  A poor signal with IC = 0.01 barely moves
+           the needle; a strong one with IC = 0.12 carries 12× the weight.
+
+        2. Contrarian flip — if IC < 0, the raw vote is INVERTED automatically.
+           Example: ML says prob_up = 70% (raw vote = +1) but IC_ml = −0.05
+           because for this stock the model has historically fired bullish right
+           before DOWN moves → effective_vote = +1 × sign(−0.05) = −1.
+           The signal now correctly opposes the BUY.
+
+        Regime is a signal, not a gate
+        ───────────────────────────────
+        Bear market regime reduces the score (negative vote with its own IC weight)
+        but does not block an 'Execute now' verdict outright.  The user decides
+        whether to enter — the system just shows the full picture.
+
+        Returns
+        ───────
+        verdict, colour, score (IC-weighted), composite_ic, ic_tstat,
+        expected_alpha, alpha_se, kelly_size, confidence_pct,
+        agree, oppose, n_signals, n_active, signals, top_reasons,
+        regime_label, regime_override (always False)
         """
-        last = feat_df.iloc[-1]
-        rsi   = float(last["rsi_14"])
-        macd  = float(last["macd_hist"])
-        vs200 = float(last["price_vs_sma200"])
-        bb    = float(last["bb_pct"])
-        vol_r = float(last["vol_ratio"])
-        ret5  = float(last["ret_5d"])
+        from scipy.stats import spearmanr
+
+        last   = feat_df.iloc[-1]
+        rsi    = float(last["rsi_14"])
+        macd   = float(last["macd_hist"])
+        vs200  = float(last["price_vs_sma200"])
+        vol_r  = float(last["vol_ratio"])
+        h52w   = float(last["high_52w_pct"])
+        vol_21 = float(last["vol_21"])
         regime_label = REGIME_LABELS.get(regime, "Unknown")
 
-        # ── Signal definitions ────────────────────────────────────────────────
-        # Each entry: (name, vote, value_str, favour_reason, oppose_reason)
-        # vote: +1 = favours trade, -1 = opposes, 0 = neutral
+        # ── Per-signal IC on training data (first 70%, no look-ahead) ────────
+        _df  = feat_df.copy()
+        _df["_fwd"] = np.log(_df["close"].shift(-lookahead) / _df["close"])
+        _df  = _df.dropna()
+        _spl = int(len(_df) * 0.70)
+        _tr  = _df.iloc[:_spl]
+        _n   = max(len(_tr), 1)
 
+        def _ic(col: str, inv: bool = False) -> float:
+            if col not in _tr.columns or _n < 50:
+                return 0.04
+            v  = _tr[col].values.astype(float) * (-1.0 if inv else 1.0)
+            f  = _tr["_fwd"].values.astype(float)
+            ok = np.isfinite(v) & np.isfinite(f)
+            if ok.sum() < 50:
+                return 0.04
+            val, _ = spearmanr(v[ok], f[ok])
+            return float(val) if not np.isnan(val) else 0.04
+
+        ic_map = {
+            "Market Regime":       max(_ic("price_vs_sma200"), 0.03),
+            "RSI (14)":            _ic("rsi_14",          inv=True),
+            "MACD":                _ic("macd_hist"),
+            "vs SMA 200":          _ic("price_vs_sma200"),
+            "52W High Proximity":  _ic("high_52w_pct"),
+            "Vol Regime":          _ic("vol_ratio",        inv=True),
+            "ML Signal":           0.04,
+        }
+
+        # ML IC from OOS probability series — no look-ahead bias
+        if ml_probs is not None and len(ml_probs) > 30:
+            _fwd_ml = np.log(feat_df["close"].shift(-lookahead) / feat_df["close"])
+            _common = ml_probs.index.intersection(_fwd_ml.dropna().index)
+            if len(_common) > 30:
+                _v, _ = spearmanr(ml_probs.reindex(_common).values,
+                                   _fwd_ml.reindex(_common).values)
+                if not np.isnan(_v):
+                    ic_map["ML Signal"] = float(_v)
+
+        # ── Signal definitions ────────────────────────────────────────────────
         raw_signals = []
 
         # 1. Market Regime (HMM)
         if direction == "BUY":
             rv = +1 if regime == 0 else (-1 if regime == 2 else 0)
             raw_signals.append({
-                "name":  "Market Regime",
-                "vote":  rv,
+                "name": "Market Regime", "vote": rv, "ic": ic_map["Market Regime"],
                 "value": regime_label,
-                "reason_for":    f"Bull regime ({regime_label}) historically favours entries.",
-                "reason_against": f"Regime is {regime_label} — elevated risk for new longs.",
+                "reason_for":    f"Bull regime ({regime_label}) favours new longs.",
+                "reason_against": f"{regime_label} regime — elevated macro risk for new longs.",
             })
         else:
             rv = +1 if regime == 2 else (-1 if regime == 0 else 0)
             raw_signals.append({
-                "name":  "Market Regime",
-                "vote":  rv,
+                "name": "Market Regime", "vote": rv, "ic": ic_map["Market Regime"],
                 "value": regime_label,
                 "reason_for":    f"Bear regime ({regime_label}) supports reducing exposure.",
-                "reason_against": f"Bull regime ({regime_label}) — selling into strength.",
+                "reason_against": f"Bull regime ({regime_label}) — selling into macro strength.",
             })
 
-        # 2. RSI — momentum / mean reversion
+        # 2. RSI (14)
         if direction == "BUY":
             rv = +1 if rsi < 55 else (-1 if rsi > 70 else 0)
             raw_signals.append({
-                "name":  "RSI (14)",
-                "vote":  rv,
+                "name": "RSI (14)", "vote": rv, "ic": ic_map["RSI (14)"],
                 "value": f"{rsi:.1f}",
                 "reason_for":    f"RSI {rsi:.1f} — not overbought, room to run.",
-                "reason_against": f"RSI {rsi:.1f} — overbought territory, mean-reversion risk.",
+                "reason_against": f"RSI {rsi:.1f} — overbought, mean-reversion risk.",
             })
         else:
             rv = +1 if rsi > 60 else (-1 if rsi < 35 else 0)
             raw_signals.append({
-                "name":  "RSI (14)",
-                "vote":  rv,
+                "name": "RSI (14)", "vote": rv, "ic": ic_map["RSI (14)"],
                 "value": f"{rsi:.1f}",
-                "reason_for":    f"RSI {rsi:.1f} — elevated, favours trimming.",
+                "reason_for":    f"RSI {rsi:.1f} — elevated, good trim level.",
                 "reason_against": f"RSI {rsi:.1f} — oversold, selling into weakness.",
             })
 
-        # 3. MACD Histogram — momentum direction
+        # 3. MACD Histogram
         if direction == "BUY":
             rv = +1 if macd > 0 else -1
             raw_signals.append({
-                "name":  "MACD",
-                "vote":  rv,
+                "name": "MACD", "vote": rv, "ic": ic_map["MACD"],
                 "value": f"{macd:+.3f}",
-                "reason_for":    f"MACD histogram positive ({macd:+.3f}) — upward momentum.",
-                "reason_against": f"MACD histogram negative ({macd:+.3f}) — momentum is falling.",
+                "reason_for":    f"MACD histogram {macd:+.3f} — upward momentum.",
+                "reason_against": f"MACD histogram {macd:+.3f} — momentum falling.",
             })
         else:
             rv = +1 if macd < 0 else -1
             raw_signals.append({
-                "name":  "MACD",
-                "vote":  rv,
+                "name": "MACD", "vote": rv, "ic": ic_map["MACD"],
                 "value": f"{macd:+.3f}",
-                "reason_for":    f"MACD negative ({macd:+.3f}) — downward momentum supports sell.",
-                "reason_against": f"MACD positive ({macd:+.3f}) — selling into rising momentum.",
+                "reason_for":    f"MACD {macd:+.3f} — downward momentum, supports sell.",
+                "reason_against": f"MACD {macd:+.3f} — selling into rising momentum.",
             })
 
-        # 4. SMA 200 — structural trend
+        # 4. vs SMA 200
         if direction == "BUY":
             rv = +1 if vs200 > 0 else -1
             raw_signals.append({
-                "name":  "vs SMA 200",
-                "vote":  rv,
+                "name": "vs SMA 200", "vote": rv, "ic": ic_map["vs SMA 200"],
                 "value": f"{vs200:+.1%}",
                 "reason_for":    f"Price {vs200:+.1%} above SMA200 — long-term uptrend intact.",
                 "reason_against": f"Price {vs200:+.1%} below SMA200 — buying against the trend.",
@@ -1900,141 +1961,136 @@ with tab6:
         else:
             rv = +1 if vs200 < 0 else -1
             raw_signals.append({
-                "name":  "vs SMA 200",
-                "vote":  rv,
+                "name": "vs SMA 200", "vote": rv, "ic": ic_map["vs SMA 200"],
                 "value": f"{vs200:+.1%}",
-                "reason_for":    f"Price {vs200:+.1%} below SMA200 — structural downtrend, trim.",
+                "reason_for":    f"Price {vs200:+.1%} below SMA200 — downtrend, supports trim.",
                 "reason_against": f"Price {vs200:+.1%} above SMA200 — selling long-term strength.",
             })
 
-        # 5. Bollinger %B — price extremes
+        # 5. 52-Week High Proximity (replaces BB %B which has r=0.92 with RSI)
         if direction == "BUY":
-            rv = +1 if bb < 0.75 else -1
+            rv = +1 if h52w > -0.10 else (-1 if h52w < -0.20 else 0)
             raw_signals.append({
-                "name":  "Bollinger %B",
-                "vote":  rv,
-                "value": f"{bb:.2f}",
-                "reason_for":    f"%B = {bb:.2f} — price not at upper band, room to buy.",
-                "reason_against": f"%B = {bb:.2f} — price near upper Bollinger Band, stretched.",
+                "name": "52W High Proximity", "vote": rv, "ic": ic_map["52W High Proximity"],
+                "value": f"{h52w:+.1%}",
+                "reason_for":    f"Price only {h52w:+.1%} from 52-week high — long-term strength.",
+                "reason_against": f"Price {h52w:+.1%} from 52-week high — in meaningful correction.",
             })
         else:
-            rv = +1 if bb > 0.6 else -1
+            rv = +1 if h52w < -0.20 else (-1 if h52w > -0.05 else 0)
             raw_signals.append({
-                "name":  "Bollinger %B",
-                "vote":  rv,
-                "value": f"{bb:.2f}",
-                "reason_for":    f"%B = {bb:.2f} — price elevated in band, good trim level.",
-                "reason_against": f"%B = {bb:.2f} — price near lower band, oversold.",
+                "name": "52W High Proximity", "vote": rv, "ic": ic_map["52W High Proximity"],
+                "value": f"{h52w:+.1%}",
+                "reason_for":    f"Price {h52w:+.1%} from 52-week high — weakness, good trim.",
+                "reason_against": f"Price only {h52w:+.1%} from 52-week high — selling yearly strength.",
             })
 
-        # 6. Volatility Regime — risk context
+        # 6. Volatility Regime
         if direction == "BUY":
             rv = +1 if vol_r < 1.1 else (-1 if vol_r > 1.5 else 0)
             raw_signals.append({
-                "name":  "Vol Regime",
-                "vote":  rv,
-                "value": f"{vol_r:.2f}×",
+                "name": "Vol Regime", "vote": rv, "ic": ic_map["Vol Regime"],
+                "value": f"{vol_r:.2f}x",
                 "reason_for":    f"Vol ratio {vol_r:.2f} — short-term vol normal, stable entry.",
-                "reason_against": f"Vol ratio {vol_r:.2f} — short-term vol elevated, timing risk.",
+                "reason_against": f"Vol ratio {vol_r:.2f} — elevated vol, timing risk.",
             })
         else:
             rv = +1 if vol_r > 1.2 else 0
             raw_signals.append({
-                "name":  "Vol Regime",
-                "vote":  rv,
-                "value": f"{vol_r:.2f}×",
-                "reason_for":    f"Vol ratio {vol_r:.2f} — elevated vol supports reducing risk.",
+                "name": "Vol Regime", "vote": rv, "ic": ic_map["Vol Regime"],
+                "value": f"{vol_r:.2f}x",
+                "reason_for":    f"Vol ratio {vol_r:.2f} — elevated, supports reducing risk.",
                 "reason_against": f"Vol ratio {vol_r:.2f} — vol normal, no urgency to sell.",
             })
 
-        # 7. ML Model P(Up) — data-driven signal
-        # Threshold raised to 0.60/0.40: at ±5% of 50% the model rarely has
-        # calibrated edge (Brier scores close to 0.25). Only give a strong vote
-        # at meaningful conviction levels.
+        # 7. ML Signal
         if prob_up is not None:
+            ic_ml = ic_map["ML Signal"]
+            is_contrarian = ic_ml < 0
             if direction == "BUY":
                 rv = +1 if prob_up > 0.60 else (-1 if prob_up < 0.40 else 0)
-                raw_signals.append({
-                    "name":  "ML Signal",
-                    "vote":  rv,
-                    "value": f"{prob_up:.1%}",
-                    "reason_for":    f"ML model estimates {prob_up:.1%} probability of up move.",
-                    "reason_against": f"ML model only estimates {prob_up:.1%} chance of up — weak conviction.",
-                })
             else:
                 rv = +1 if prob_up < 0.40 else (-1 if prob_up > 0.60 else 0)
-                raw_signals.append({
-                    "name":  "ML Signal",
-                    "vote":  rv,
-                    "value": f"{prob_up:.1%}",
-                    "reason_for":    f"ML model estimates {prob_up:.1%} probability of up — supports sell.",
-                    "reason_against": f"ML model estimates {prob_up:.1%} probability of up — model says hold.",
-                })
+            raw_signals.append({
+                "name":       "ML Signal",
+                "vote":       rv,
+                "ic":         ic_ml,
+                "value":      f"{prob_up:.1%}",
+                "contrarian": is_contrarian,
+                "reason_for":    f"ML model estimates {prob_up:.1%} probability of up move.",
+                "reason_against": (
+                    f"ML model says {prob_up:.1%} but IC={ic_ml:+.3f} — CONTRARIAN for this "
+                    f"stock. High ML confidence here has historically preceded DOWN moves."
+                    if is_contrarian else
+                    f"ML model only {prob_up:.1%} — below 60% conviction threshold."
+                ),
+            })
 
-        # ── Aggregate ─────────────────────────────────────────────────────────
-        votes  = [s["vote"] for s in raw_signals]
-        n      = len(votes)
-        score  = sum(votes) / n
+        # ── IC-Weighted Aggregation ───────────────────────────────────────────
+        # effective_vote = raw_vote * sign(IC)
+        # — positive IC: signal fires correctly → vote stands
+        # — negative IC: signal is contrarian → vote is flipped
+        for s in raw_signals:
+            s["eff_vote"] = s["vote"] * (np.sign(s["ic"]) if s["ic"] != 0 else 1.0)
 
-        agree  = sum(1 for v in votes if v == +1)
-        oppose = sum(1 for v in votes if v == -1)
+        weights = [max(abs(s["ic"]), 0.01) for s in raw_signals]
+        total_w = sum(weights)
+        score   = sum(s["eff_vote"] * w for s, w in zip(raw_signals, weights)) / total_w
 
-        # Confidence = % of ACTIVE (non-neutral) signals that agree with direction.
-        # Dividing by n (total) dilutes the reading when many signals are neutral;
-        # dividing by n_active shows true conviction among signals that took a side.
-        n_active = max(1, agree + oppose)
-        confidence_pct = int(100 * agree / n_active)
+        agree_n  = sum(1 for s in raw_signals if s["eff_vote"] > 0)
+        oppose_n = sum(1 for s in raw_signals if s["eff_vote"] < 0)
+        n_active = agree_n + oppose_n
+        agree_w  = sum(w for s, w in zip(raw_signals, weights) if s["eff_vote"] > 0)
+        confidence_pct = int(100 * agree_w / total_w) if total_w > 0 else 0
 
-        # Top reasons: strongest for + strongest against
-        for_reasons     = [s["reason_for"]     for s in raw_signals if s["vote"] == +1]
-        against_reasons = [s["reason_against"] for s in raw_signals if s["vote"] == -1]
+        # ── Expected Alpha ────────────────────────────────────────────────────
+        composite_ic   = sum(s["ic"] * w for s, w in zip(raw_signals, weights)) / total_w
+        vol_fwd        = vol_21 * np.sqrt(lookahead / 252)
+        expected_alpha = composite_ic * vol_fwd
+        alpha_se       = vol_fwd / np.sqrt(max(_n, 50))
+        ic_tstat       = composite_ic * np.sqrt(max(_n, 50)) / np.sqrt(max(1 - composite_ic**2, 1e-10))
+
+        # ── Half-Kelly Position Sizing ────────────────────────────────────────
+        p_win      = float(np.clip(0.5 + composite_ic / 2, 0.01, 0.99))
+        kelly_size = float(np.clip((2 * p_win - 1) / 2, 0.005, 0.20))
+
+        # ── Verdict ───────────────────────────────────────────────────────────
+        if score >= 0.43:
+            verdict, colour = "✅ Execute now",            "#1D9E75"
+        elif score >= 0.0:
+            verdict, colour = "⚠️ Proceed with caution", "#F5A623"
+        else:
+            verdict, colour = "🔴 Wait for better entry", "#D85A30"
+
+        for_reasons     = [s["reason_for"]     for s in raw_signals if s["eff_vote"] > 0]
+        against_reasons = [s["reason_against"] for s in raw_signals if s["eff_vote"] < 0]
         top_reasons = []
         if for_reasons:     top_reasons.append(("for",     for_reasons[0]))
         if against_reasons: top_reasons.append(("against", against_reasons[0]))
 
-        # ── Verdict thresholds ────────────────────────────────────────────────
-        # Raised from 0.35 → 0.43: with 7 signals this requires at least 3 net
-        # positive votes (e.g. 5 for / 2 against), versus the old 0.35 which
-        # allowed 4 for / 1 against / 2 neutral.  More demanding = fewer false
-        # "Execute now" verdicts on marginal set-ups.
-        if score >= 0.43:
-            verdict = "✅ Execute now"
-            colour  = "#1D9E75"
-        elif score >= 0.0:
-            verdict = "⚠️ Proceed with caution"
-            colour  = "#F5A623"
-        else:
-            verdict = "🔴 Wait for better entry"
-            colour  = "#D85A30"
-
-        # ── Regime hard-gate for BUY ──────────────────────────────────────────
-        # A Bear / High-Vol regime (regime 2) is not a valid backdrop for a new
-        # long entry, regardless of what individual technical signals say.
-        # Individual technicals can stay "green" while the market is in a bear
-        # regime (e.g. price above its own SMA200 but the overall market is in
-        # drawdown mode). Cap BUY verdicts at "Proceed with caution" in regime 2.
-        regime_override = False
-        if direction == "BUY" and regime == 2 and verdict == "✅ Execute now":
-            verdict = "⚠️ Proceed with caution"
-            colour  = "#F5A623"
-            regime_override = True
-
         return {
-            "verdict":         verdict,
-            "colour":          colour,
-            "score":           score,
-            "confidence_pct":  confidence_pct,
-            "agree":           agree,
-            "oppose":          oppose,
-            "n_signals":       n,
-            "n_active":        n_active,
-            "signals":         raw_signals,
-            "top_reasons":     top_reasons,
-            "regime_label":    regime_label,
-            "regime_override": regime_override,
+            "verdict":        verdict,
+            "colour":         colour,
+            "score":          round(score, 3),
+            "composite_ic":   round(composite_ic, 4),
+            "ic_tstat":       round(ic_tstat, 2),
+            "expected_alpha": round(expected_alpha, 4),
+            "alpha_se":       round(alpha_se, 4),
+            "kelly_size":     round(kelly_size, 3),
+            "confidence_pct": confidence_pct,
+            "agree":          agree_n,
+            "oppose":         oppose_n,
+            "n_signals":      len(raw_signals),
+            "n_active":       n_active,
+            "signals":        raw_signals,
+            "top_reasons":    top_reasons,
+            "regime_label":   regime_label,
+            "regime_override": False,
         }
 
-    # ── PERSISTENCE HELPERS ───────────────────────────────────────────────────
+
+
+        # ── PERSISTENCE HELPERS ───────────────────────────────────────────────────
     # On Streamlit Cloud the app container restarts after inactivity, wiping
     # session_state. We persist holdings and BL weights to a JSON file in the
     # app's working directory so they survive cold starts.
@@ -2412,19 +2468,24 @@ with tab6:
             verdict_details = {}   # ticker → full scorecard dict
             for t in trade_df.index:
                 direction = trade_df.loc[t, "Direction"]
+                prob_up_now = None
+                prob_s_now  = None
                 try:
-                    fd_t   = compute_features(closes[t].dropna(), volumes[t].dropna())
-                    prob_s, _, _, _ = train_ml_model(fd_t, lookahead=lookahead)
-                    prob_up_now = float(prob_s.iloc[-1])
+                    fd_t = compute_features(closes[t].dropna(), volumes[t].dropna())
+                    prob_s_now, _, _, _ = train_ml_model(fd_t, lookahead=lookahead)
+                    prob_up_now = float(prob_s_now.iloc[-1])
                 except Exception:
-                    prob_up_now = None
+                    pass
 
                 try:
                     fd_t = compute_features(closes[t].dropna(), volumes[t].dropna())
                 except Exception:
                     continue
 
-                sc = score_entry_timing(t, fd_t, current_regime_plan, prob_up_now, direction)
+                sc = score_entry_timing(
+                    t, fd_t, current_regime_plan, prob_up_now, direction,
+                    lookahead=lookahead, ml_probs=prob_s_now,
+                )
                 verdict_details[t] = sc
 
                 verdict_rows.append({
@@ -2507,24 +2568,57 @@ with tab6:
                         with col_b:
                             st.markdown(
                                 f"<div style='font-size:0.75rem; color:#8b949e; margin-bottom:2px;'>"
-                                f"Signal agreement (active signals only)</div>"
+                                f"Signal agreement (IC-weighted)</div>"
                                 f"<div style='font-family: monospace; font-size:1.1rem; "
                                 f"color:{bar_color}; letter-spacing:2px;'>{bar}</div>"
                                 f"<div style='font-size:0.75rem; color:#8b949e;'>"
-                                f"{conf}% of active signals favour this trade "
+                                f"{conf}% of IC-weighted votes favour this trade "
                                 f"({sc['agree']} for, {sc['oppose']} against, "
                                 f"{sc['n_signals'] - sc['agree'] - sc['oppose']} neutral)</div>",
                                 unsafe_allow_html=True,
                             )
 
-                        # Regime override banner
-                        if sc.get("regime_override"):
-                            st.warning(
-                                "⚠️ **Regime gate applied** — SPY HMM is in Bear / High-Vol "
-                                "regime. Verdict capped at *Proceed with caution* regardless "
-                                "of technical signals. Avoid opening new longs in a bear market.",
-                                icon=None,
-                            )
+                        # ── Quantitative edge metrics ─────────────────────────
+                        st.markdown("---")
+                        st.markdown("**Quantitative Edge**")
+                        qc1, qc2, qc3 = st.columns(3)
+                        alpha_pct = sc["expected_alpha"] * 100
+                        se_pct    = sc["alpha_se"] * 100
+                        ic_t      = sc["ic_tstat"]
+                        qc1.metric(
+                            f"Expected α ({lookahead}d)",
+                            f"{alpha_pct:+.2f}%",
+                            delta=f"±{se_pct:.2f}% (1σ)",
+                            help=(
+                                "Expected edge = composite IC × forward vol. "
+                                "The ±1σ band shows how uncertain this estimate is. "
+                                "A wide band means the model may be wrong by much more."
+                            ),
+                        )
+                        sig_label = "✅ Significant" if abs(ic_t) >= 1.65 else "⚠️ Not significant"
+                        sig_color = "normal" if abs(ic_t) >= 1.65 else "off"
+                        qc2.metric(
+                            "IC t-statistic",
+                            f"{ic_t:+.2f}",
+                            delta=sig_label,
+                            delta_color=sig_color,
+                            help=(
+                                "t-stat = composite IC × √N / √(1-IC²). "
+                                "≥ 1.65 = 90% confidence edge is real. "
+                                "≥ 1.96 = 95% confidence. "
+                                "Below 1.65: the apparent edge may be noise."
+                            ),
+                        )
+                        qc3.metric(
+                            "Half-Kelly size",
+                            f"{sc['kelly_size']:.1%}",
+                            help=(
+                                "Suggested position as % of portfolio (half-Kelly). "
+                                "Formula: Kelly = 2p − 1 where p ≈ 0.5 + IC/2, "
+                                "then halved for safety. This is the institutional "
+                                "standard — captures most EV while halving variance."
+                            ),
+                        )
 
                         st.markdown("---")
 
@@ -2539,18 +2633,21 @@ with tab6:
 
                         # Per-signal scorecard
                         st.markdown("**Signal breakdown:**")
-                        sig_cols = st.columns([2, 1, 4])
+                        sig_cols = st.columns([2, 1, 1, 3])
                         sig_cols[0].markdown("**Signal**")
                         sig_cols[1].markdown("**Value · Vote**")
-                        sig_cols[2].markdown("**Reasoning**")
+                        sig_cols[2].markdown("**IC**")
+                        sig_cols[3].markdown("**Reasoning**")
 
                         for sig in sc["signals"]:
-                            vote = sig["vote"]
-                            icon = VOTE_ICON[vote]
-                            col_col = VOTE_COLOR[vote]
-                            reason_text = (sig["reason_for"] if vote >= 0
-                                           else sig["reason_against"])
-                            c1, c2, c3 = st.columns([2, 1, 4])
+                            eff  = sig.get("eff_vote", sig["vote"])
+                            icon = VOTE_ICON.get(int(np.sign(eff)), "➖") if eff != 0 else "➖"
+                            col_col = VOTE_COLOR.get(int(np.sign(eff)), "#8b949e") if eff != 0 else "#8b949e"
+                            reason_text = (sig["reason_for"] if eff >= 0 else sig["reason_against"])
+                            ic_val  = sig.get("ic", 0)
+                            ic_str  = f"{ic_val:+.3f}"
+                            ic_note = " ⚠️" if sig.get("contrarian") else ""
+                            c1, c2, c3, c4 = st.columns([2, 1, 1, 3])
                             c1.markdown(
                                 f"<span style='color:#c9d1d9;'>{sig['name']}</span>",
                                 unsafe_allow_html=True,
@@ -2560,7 +2657,13 @@ with tab6:
                                 f"<span style='font-size:1rem;'>{icon}</span>",
                                 unsafe_allow_html=True,
                             )
+                            ic_color = "#1D9E75" if ic_val > 0.05 else ("#D85A30" if ic_val < 0 else "#F5A623")
                             c3.markdown(
+                                f"<span style='color:{ic_color}; font-family:monospace; font-size:0.8rem;'>"
+                                f"{ic_str}{ic_note}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            c4.markdown(
                                 f"<span style='color:{col_col}; font-size:0.82rem;'>{reason_text}</span>",
                                 unsafe_allow_html=True,
                             )
@@ -2687,8 +2790,8 @@ with tab7:
 
     st.divider()
 
-    # ── A: BACKTEST ───────────────────────────────────────────────────────────
-    st.markdown("### A. Backtest — Did the signals predict future returns?")
+    # ── 1: BACKTEST ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    st.markdown("### 1. Backtest — Did the signals predict future returns?")
     st.markdown(
         f"For every historical day, compute the verdict that would have been given, "
         f"then measure the actual **{audit_lookahead}-day return** that followed. "
@@ -2799,9 +2902,9 @@ with tab7:
     else:
         st.info("Not enough data for backtest — try an earlier data start date.")
 
-    # ── B: CORRELATION ────────────────────────────────────────────────────────
+    # ── 2: CORRELATION ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
     st.divider()
-    st.markdown("### B. Signal Correlation — Which signals are redundant?")
+    st.markdown("### 2. Signal Correlation — Which signals are redundant?")
     st.markdown(
         "High correlation (|r| > 0.7) between two signals means they carry the same "
         "information. The scoring function still counts them as two independent votes, "
@@ -2862,9 +2965,9 @@ with tab7:
     except Exception as e:
         st.warning(f"Could not compute correlation matrix: {e}")
 
-    # ── C: CALIBRATION ────────────────────────────────────────────────────────
+    # ── 3: CALIBRATION ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
     st.divider()
-    st.markdown("### C. Calibration — Does P(up) = 70% mean up 70% of the time?")
+    st.markdown("### 3. Calibration — Does P(up) = 70% mean up 70% of the time?")
     st.markdown(
         "A well-calibrated model follows the diagonal — predicted probability equals "
         "actual frequency. Above diagonal = under-confident. Below = over-confident. "
@@ -2935,67 +3038,99 @@ with tab7:
     except Exception as e:
         st.warning(f"Could not compute calibration: {e}")
 
-    # ── D: PER-SIGNAL HIT RATES ───────────────────────────────────────────────
+    # ── 4: PER-SIGNAL HIT RATES ────────────────────────────────────────────────────────────────────────────────────────────────
     st.divider()
-    st.markdown("### D. Per-Signal Hit Rates — Which signals actually work for this stock?")
+    st.markdown("### 4. Per-Signal Hit Rates & IC — Which signals actually work for this stock?")
     st.markdown(
         f"When each signal alone fires 'bullish', what fraction of the following "
         f"{audit_lookahead}-day periods were actually positive? "
-        "**50% = coin flip. >55% = useful. >60% = strong. <50% = contrarian for this stock.**"
+        "**Win Rate** = binary accuracy. **IC** (Spearman) = continuous predictive correlation — "
+        "the institutional standard. IC < 0 = contrarian (signal fires in the WRONG direction)."
     )
 
     try:
+        from scipy.stats import spearmanr as _spearmanr
         regimes_hr, _, _ = fit_hmm(np.log(spy / spy.shift(1)).dropna(), n_regimes=n_regimes)
         ml_probs_hr, _, _, _ = train_ml_model(audit_fd, lookahead=audit_lookahead)
 
-        fwd_hr  = (np.log(audit_price.shift(-audit_lookahead) / audit_price) > 0
-                   ).reindex(audit_fd.index)
+        fwd_hr  = np.log(audit_price.shift(-audit_lookahead) / audit_price).reindex(audit_fd.index)
+        fwd_bin = (fwd_hr > 0)
         common  = audit_fd.index.intersection(fwd_hr.dropna().index)
-        fwd_c   = fwd_hr.reindex(common)
+        fwd_c   = fwd_bin.reindex(common)
+        fwd_ret = fwd_hr.reindex(common)
         regime_c = regimes_hr.reindex(common).fillna(1)
         ml_c    = ml_probs_hr.reindex(common).fillna(0.5)
 
         checks = [
-            ("Market Regime (Bull)",  (regime_c == 0)),
-            ("RSI < 55",              (audit_fd["rsi_14"].reindex(common) < 55)),
-            ("MACD positive",         (audit_fd["macd_hist"].reindex(common) > 0)),
-            ("Above SMA200",          (audit_fd["price_vs_sma200"].reindex(common) > 0)),
-            ("BB %B < 0.75",          (audit_fd["bb_pct"].reindex(common) < 0.75)),
-            ("Low vol ratio (<1.1)",  (audit_fd["vol_ratio"].reindex(common) < 1.1)),
-            ("ML P(Up) > 55%",        (ml_c > 0.55)),
+            ("Market Regime (Bull)",     (regime_c == 0),                           None,                                   None),
+            ("RSI < 55",                 (audit_fd["rsi_14"].reindex(common) < 55), -audit_fd["rsi_14"].reindex(common),     "Lower RSI → more bullish"),
+            ("MACD positive",            (audit_fd["macd_hist"].reindex(common) > 0), audit_fd["macd_hist"].reindex(common), "Positive MACD → bullish"),
+            ("Above SMA200",             (audit_fd["price_vs_sma200"].reindex(common) > 0), audit_fd["price_vs_sma200"].reindex(common), "Above SMA200 → bullish"),
+            ("52W High Proximity (>-10%)", (audit_fd["high_52w_pct"].reindex(common) > -0.10), audit_fd["high_52w_pct"].reindex(common), "Nearer 52w high → bullish"),
+            ("Low vol ratio (<1.1)",     (audit_fd["vol_ratio"].reindex(common) < 1.1), -audit_fd["vol_ratio"].reindex(common), "Lower vol → better entry"),
+            ("ML P(Up) > 60%",           (ml_c > 0.60),                             ml_c,                                   "Higher P(Up) → bullish"),
         ]
 
         hit_rows = []
-        for sig_name, sig_mask in checks:
+        for sig_name, sig_mask, sig_vals, ic_note in checks:
             n_days = int(sig_mask.sum())
+
+            # Binary win rate
             if n_days < 10:
                 hit_rows.append({"Signal": sig_name, "N days": n_days,
                                   "Win Rate": None, "Edge vs 50%": None,
+                                  "IC (Spearman)": None, "IC t-stat": None,
                                   "Assessment": "Too few obs"})
                 continue
             win_rate = float(fwd_c[sig_mask].mean())
             edge     = win_rate - 0.5
-            assess   = ("Strong ✅"      if edge > 0.10 else
-                        "Useful ✓"       if edge > 0.05 else
-                        "Marginal"       if edge > 0    else
-                        "Contrarian ⚠️"  if edge > -0.05 else
-                        "Inverse ❌")
-            hit_rows.append({"Signal": sig_name, "N days": n_days,
-                              "Win Rate": win_rate, "Edge vs 50%": edge,
-                              "Assessment": assess})
+
+            # Spearman IC on continuous signal values
+            ic_val = None
+            ic_t   = None
+            if sig_vals is not None:
+                _v = sig_vals.reindex(common).values.astype(float)
+                _f = fwd_ret.values.astype(float)
+                _ok = np.isfinite(_v) & np.isfinite(_f)
+                if _ok.sum() >= 30:
+                    _ic, _ = _spearmanr(_v[_ok], _f[_ok])
+                    if not np.isnan(_ic):
+                        ic_val = round(float(_ic), 4)
+                        ic_t   = round(float(_ic) * np.sqrt(_ok.sum()) /
+                                       np.sqrt(max(1 - float(_ic)**2, 1e-10)), 2)
+
+            assess = ("Strong ✅"      if edge > 0.10 else
+                      "Useful ✓"       if edge > 0.05 else
+                      "Marginal"       if edge > 0    else
+                      "Contrarian ⚠️"  if edge > -0.05 else
+                      "Inverse ❌")
+            if ic_val is not None and ic_val < 0 and assess not in ("Contrarian ⚠️","Inverse ❌"):
+                assess += " (IC negative)"
+            hit_rows.append({
+                "Signal":       sig_name,
+                "N days":       n_days,
+                "Win Rate":     win_rate,
+                "Edge vs 50%":  edge,
+                "IC (Spearman)": ic_val,
+                "IC t-stat":    ic_t,
+                "Assessment":   assess,
+            })
 
         hit_df = pd.DataFrame(hit_rows).set_index("Signal")
         st.dataframe(
             hit_df.style
             .format({"Win Rate": "{:.1%}", "Edge vs 50%": "{:+.1%}",
-                     "N days": "{:.0f}"}, na_rep="—")
-            .background_gradient(subset=["Win Rate"], cmap="RdYlGn", vmin=0.40, vmax=0.65),
+                     "N days": "{:.0f}", "IC (Spearman)": "{:+.4f}",
+                     "IC t-stat": "{:+.2f}"}, na_rep="—")
+            .background_gradient(subset=["Win Rate"], cmap="RdYlGn", vmin=0.40, vmax=0.65)
+            .background_gradient(subset=["IC (Spearman)"], cmap="RdYlGn", vmin=-0.1, vmax=0.1),
             width="stretch",
         )
         st.caption(
-            "Signals marked **Contrarian** or **Inverse** work backwards for this stock. "
-            "This tells you where equal-weighting breaks down — and which signals "
-            "deserve more or less influence in the scoring function."
+            "**IC interpretation:** IC > 0.05 = useful. IC > 0.10 = strong. "
+            "IC < 0 = CONTRARIAN — in the scoring function the vote for this signal is "
+            "automatically flipped. **IC t-stat ≥ 1.65** = edge is statistically significant "
+            "at 90% confidence. Below that, the apparent edge may be noise."
         )
 
     except Exception as e:
